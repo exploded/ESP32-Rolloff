@@ -1,0 +1,5 @@
+.pio
+.vscode/
+
+# WiFi credentials — keep off GitHub
+include/wifi_credentials.h
