@@ -38,8 +38,8 @@ An ESP32-based controller for a rolloff observatory roof. Implements the [ASCOM 
 ```
 LEFT SIDE                              RIGHT SIDE
 ─────────────────────────────────      ─────────────────────────────
-3V3   ── OLED VCC                      VIN
-GND   ── OLED GND                      GND  ── switch common (both)
+3V3   OLED VCC                         VIN
+GND   OLED GND, Relay GND              GND  Limit sw common (both)
 D15                                    D13
 D2                                     D12
 D4                                     D14
@@ -47,8 +47,8 @@ RX2                                    D27
 TX2                                    D26
 D5                                     D25
 D18 (GPIO18) ── Relay signal           D33 (GPIO33) ── Limit sw OPEN
-D19 (GPIO19) ── OLED SCK ┐ adjacent   D32 (GPIO32) ── Limit sw CLOSED
-D21 (GPIO21) ── OLED SDA ┘            D35
+D19 (GPIO19) ── OLED SCK ┐ adjacent    D32 (GPIO32) ── Limit sw CLOSED
+D21 (GPIO21) ── OLED SDA ┘             D35
 RX0                                    D34
 TX0                                    VN
 D22                                    VP

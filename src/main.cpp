@@ -487,7 +487,25 @@ void setup()
 
     // OLED (I2C on GPIO19=SCL, GPIO21=SDA)
     Wire.begin(OLED_SDA, OLED_SCL);
-    s_oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
+
+    // Scan I2C bus to find the OLED address.
+    // Note: Adafruit SSD1306 begin() returns true even when no device is present
+    // (it only checks RAM allocation), so we use the scan as the real indicator.
+    Serial.print("I2C scan: ");
+    uint8_t oledAddr = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("0x%02X ", addr);
+            if ((addr == 0x3C || addr == 0x3D) && oledAddr == 0) oledAddr = addr;
+        }
+    }
+    Serial.println(oledAddr ? "" : "no devices found — check SDA→D21 SCL→D19 wiring");
+
+    // Only initialise the display if a known SSD1306 address was actually found
+    if (oledAddr) {
+        s_oledOk = display.begin(SSD1306_SWITCHCAPVCC, oledAddr);
+    }
     if (s_oledOk) {
         display.clearDisplay();
         display.setTextSize(1);
@@ -502,13 +520,33 @@ void setup()
         Serial.println("OLED init failed - continuing without display");
     }
 
-    // WiFi
+    // WiFi — 30 s timeout, then restart and try again
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
+    {
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            Serial.print(".");
+            if (++attempts >= 60) {          // 60 × 500 ms = 30 s
+                Serial.println("\nWiFi failed — restarting in 3 s");
+                if (s_oledOk) {
+                    display.clearDisplay();
+                    display.setTextSize(1);
+                    display.setTextColor(SSD1306_WHITE);
+                    display.setCursor(0, 0);
+                    display.print("WiFi failed!");
+                    display.setCursor(0, 12);
+                    display.print(WIFI_SSID);
+                    display.setCursor(0, 24);
+                    display.print("Restarting...");
+                    display.display();
+                }
+                delay(3000);
+                ESP.restart();
+            }
+        }
     }
     Serial.println();
     Serial.print("Connected!  IP: ");
