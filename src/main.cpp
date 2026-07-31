@@ -62,6 +62,7 @@
 #include <WebServer.h>
 #include <WiFiUDP.h>
 #include <Wire.h>
+#include <esp_task_wdt.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "wifi_credentials.h"
@@ -84,6 +85,31 @@
 #define RELAY_PULSE_MS       250
 #define MOVEMENT_TIMEOUT_MS  (120UL * 1000UL)
 #define OLED_REFRESH_MS      500
+
+// ── OLED burn-in mitigation ───────────────────────────────────────────────────
+// This display runs static 24/7, which is exactly how SSD1306 panels develop
+// permanently dim patches.  Three defences:
+//   1. Lower drive current — the Adafruit default (0xCF) is far brighter than
+//      needed indoors and burns in proportionally faster.
+//   2. Nudge the whole layout by a few pixels periodically, so no pixel is lit
+//      continuously.  The layout leaves 1 px of vertical slack for this.
+//   3. Blank the panel entirely once idle; any state change wakes it.
+#define OLED_CONTRAST          0x30      // 0x00-0xFF, was 0xCF
+#define OLED_SHIFT_INTERVAL_MS (60UL * 1000UL)
+#define OLED_IDLE_BLANK_MS     (30UL * 60UL * 1000UL)   // 0 disables blanking
+
+// ── Watchdogs ─────────────────────────────────────────────────────────────────
+// 1. Hardware task watchdog — reboots if loop() stops running (hung handler,
+//    deadlock, crashed network stack).  Fed once per loop() iteration.
+// 2. WiFi supervisor — polls the link, re-associates, and finally reboots if
+//    the association can't be recovered.  This is the case that left the OLED
+//    showing "Connecting..." until it was power cycled.
+#define WDT_TIMEOUT_S             30
+#define WIFI_CHECK_INTERVAL_MS    5000UL   // how often to poll link state
+#define WIFI_RECONNECT_WAIT_MS   15000UL   // grace period per reconnect attempt
+#define WIFI_MAX_RECONNECT_TRIES  4        // ~60 s down, then reboot
+#define BOOT_WIFI_REBEGIN_TRIES   30       // 30 × 500 ms = 15 s, then re-begin
+#define BOOT_WIFI_MAX_TRIES       60       // 60 × 500 ms = 30 s, then reboot
 
 // ── Ports ─────────────────────────────────────────────────────────────────────
 #define INFO_PORT              80
@@ -119,6 +145,24 @@ uint32_t      s_serverTxId      = 1;
 bool          s_relayActive   = false;
 unsigned long s_relayStartMs  = 0;
 unsigned long s_lastOledMs    = 0;
+
+// WiFi supervisor state
+unsigned long s_lastWifiCheckMs = 0;
+unsigned long s_wifiDownSinceMs = 0;   // 0 = link is up
+uint8_t       s_wifiRetries     = 0;
+uint32_t      s_wifiDropCount   = 0;   // reported on the info page
+
+// OLED burn-in state
+unsigned long s_oledActivityMs = 0;    // last time something worth showing happened
+unsigned long s_lastShiftMs    = 0;
+uint8_t       s_oledShift      = 0;    // bit0 = y offset, bits1-2 = x offset
+bool          s_oledBlanked    = false;
+
+// Anything the operator would want to see on the panel calls this.
+void oledWake()
+{
+    s_oledActivityMs = millis();
+}
 
 // ── Shutter logic ─────────────────────────────────────────────────────────────
 ShutterStatus getShutterStatus()
@@ -162,6 +206,7 @@ void triggerRelayPulse()
     digitalWrite(RELAY_PIN, HIGH);
     s_relayActive  = true;
     s_relayStartMs = millis();
+    oledWake();
 }
 
 const char* shutterLabel(ShutterStatus s)
@@ -176,39 +221,134 @@ const char* shutterLabel(ShutterStatus s)
 }
 
 // ── OLED ──────────────────────────────────────────────────────────────────────
-// Layout (128x32 pixels, font size 1 = 6x8 px per character):
+// Layout (128x32 pixels, font size 1 = 6x8 px per character), all offset by
+// (dx, dy) so the image drifts slightly over time:
 //   y= 0: "Rolloff Roof"
-//   y=12: status word on inverted (white) background bar
-//   y=24: IP address (or "Connecting...")
+//   y=11: status word inside an outlined box
+//   y=23: IP address (or link-down countdown)
+// The status box is an outline rather than a filled bar: the old
+// fillRect(0,11,128,9) lit 1152 pixels continuously, which is both the main
+// burn-in source and a heavy enough load to sag the charge pump.
 void updateOLED()
 {
     if (!s_oledOk) return;
+
+    // Blank the panel once nothing has happened for a while.
+    if (OLED_IDLE_BLANK_MS && (millis() - s_oledActivityMs) > OLED_IDLE_BLANK_MS) {
+        if (!s_oledBlanked) {
+            display.clearDisplay();
+            display.display();
+            display.ssd1306_command(SSD1306_DISPLAYOFF);
+            s_oledBlanked = true;
+        }
+        return;
+    }
+    if (s_oledBlanked) {
+        display.ssd1306_command(SSD1306_DISPLAYON);
+        s_oledBlanked = false;
+    }
+
+    const int16_t dx = (s_oledShift >> 1) & 0x03;   // 0-3 px
+    const int16_t dy =  s_oledShift       & 0x01;   // 0-1 px
 
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
 
     // Row 1 — title
-    display.setCursor(0, 0);
+    display.setCursor(dx, dy);
     display.print("Rolloff Roof");
 
-    // Row 2 — status on a highlighted bar
+    // Row 2 — status word in an outlined box
     ShutterStatus status = getShutterStatus();
-    display.fillRect(0, 11, 128, 9, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(2, 12);
-    display.print(shutterLabel(status));
-    display.setTextColor(SSD1306_WHITE);
+    const char *label = shutterLabel(status);
+    int16_t boxW = (int16_t)strlen(label) * 6 + 5;
+    display.drawRect(dx, 11 + dy, boxW, 11, SSD1306_WHITE);
+    display.setCursor(dx + 3, 13 + dy);
+    display.print(label);
 
-    // Row 3 — IP address
-    display.setCursor(0, 24);
+    // Row 3 — IP address, or how long the link has been down
+    display.setCursor(dx, 23 + dy);
     if (WiFi.status() == WL_CONNECTED) {
         display.print(WiFi.localIP().toString());
+    } else if (s_wifiDownSinceMs != 0) {
+        display.printf("WiFi lost %lus", (millis() - s_wifiDownSinceMs) / 1000UL);
     } else {
         display.print("Connecting...");
     }
 
     display.display();
+}
+
+// ── Watchdog / recovery ───────────────────────────────────────────────────────
+// Reboot, but never while the roof is physically moving — a reset floats the
+// relay pin briefly, and we don't want to glitch the motor controller mid-travel.
+// Returns having done nothing if motion is in progress; the caller retries.
+void safeRestart(const char *reason)
+{
+    if (s_motionState == MOTION_OPENING || s_motionState == MOTION_CLOSING) {
+        Serial.printf("Restart requested (%s) — deferred, roof is moving\n", reason);
+        return;
+    }
+
+    Serial.printf("Restarting: %s\n", reason);
+    if (s_oledOk) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.print("Restarting");
+        display.setCursor(0, 12);
+        display.print(reason);
+        display.display();
+    }
+    Serial.flush();
+    delay(1000);
+    ESP.restart();
+}
+
+// Polled from loop().  Escalates: notice the drop → re-associate → reboot.
+void maintainWifi()
+{
+    if (millis() - s_lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) return;
+    s_lastWifiCheckMs = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (s_wifiDownSinceMs != 0) {
+            Serial.print("WiFi recovered, IP: ");
+            Serial.println(WiFi.localIP());
+            oledWake();
+        }
+        s_wifiDownSinceMs = 0;
+        s_wifiRetries     = 0;
+        return;
+    }
+
+    // First time we've seen the link down — kick off a reconnect immediately.
+    if (s_wifiDownSinceMs == 0) {
+        s_wifiDownSinceMs = millis();
+        s_wifiRetries     = 0;
+        s_wifiDropCount++;
+        Serial.println("WiFi link lost — reconnecting");
+        oledWake();   // a drop is worth lighting the panel for
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        return;
+    }
+
+    // Give the current attempt its full grace period before doing anything else.
+    if (millis() - s_wifiDownSinceMs < WIFI_RECONNECT_WAIT_MS) return;
+
+    if (s_wifiRetries >= WIFI_MAX_RECONNECT_TRIES) {
+        safeRestart("WiFi down");
+        return;   // only returns here if the roof is moving — retry next poll
+    }
+
+    s_wifiRetries++;
+    Serial.printf("WiFi reconnect attempt %u/%u\n", s_wifiRetries, WIFI_MAX_RECONNECT_TRIES);
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    s_wifiDownSinceMs = millis();
 }
 
 // ── Alpaca response helpers ───────────────────────────────────────────────────
@@ -391,6 +531,8 @@ void handleDomeAny()
 // on the Alpaca server so the browser preflight succeeds.
 void handleInfoRoot()
 {
+    oledWake();   // someone is looking at the device
+
     bool closedActive = (digitalRead(LIMIT_SWITCH_CLOSED) == LOW);
     bool openActive   = (digitalRead(LIMIT_SWITCH_OPEN)   == LOW);
     ShutterStatus status = getShutterStatus();
@@ -423,6 +565,13 @@ void handleInfoRoot()
         "<p><strong>Open switch (GPIO 33):</strong> "
             "<span style='color:" + openColor + ";'>"
             + (openActive ? "ACTIVE" : "inactive") + "</span></p>"
+        "</div>"
+        "<div class='card'>"
+        "<h2>Link</h2>"
+        "<p><strong>Uptime:</strong> " + String(millis() / 60000UL) + " min</p>"
+        "<p><strong>WiFi RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>"
+        "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
+        "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
         "</div>"
         "<div class='card'>"
         "<h2>Controls</h2>"
@@ -507,6 +656,11 @@ void setup()
         s_oledOk = display.begin(SSD1306_SWITCHCAPVCC, oledAddr);
     }
     if (s_oledOk) {
+        // Turn the drive current down before anything is shown — the library
+        // default (0xCF) is needlessly bright and accelerates burn-in.
+        display.ssd1306_command(SSD1306_SETCONTRAST);
+        display.ssd1306_command(OLED_CONTRAST);
+
         display.clearDisplay();
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
@@ -520,8 +674,12 @@ void setup()
         Serial.println("OLED init failed - continuing without display");
     }
 
-    // WiFi — 30 s timeout, then restart and try again
+    // WiFi — re-begin at 15 s, restart at 30 s
+    WiFi.persistent(false);        // don't wear out flash rewriting the same creds
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);          // modem sleep makes the link flaky under polling
+    WiFi.setAutoReconnect(true);   // first line of defence; maintainWifi() backs it up
+    WiFi.setHostname("rolloff");
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
     {
@@ -529,7 +687,19 @@ void setup()
         while (WiFi.status() != WL_CONNECTED) {
             delay(500);
             Serial.print(".");
-            if (++attempts >= 60) {          // 60 × 500 ms = 30 s
+            ++attempts;
+
+            // Half way — tear the association down and start over.  Cheaper than
+            // a reboot and clears a stuck WPA handshake.
+            if (attempts == BOOT_WIFI_REBEGIN_TRIES) {
+                Serial.print(" retrying");
+                WiFi.disconnect(true);
+                delay(200);
+                WiFi.mode(WIFI_STA);
+                WiFi.begin(WIFI_SSID, WIFI_PASS);
+            }
+
+            if (attempts >= BOOT_WIFI_MAX_TRIES) {
                 Serial.println("\nWiFi failed — restarting in 3 s");
                 if (s_oledOk) {
                     display.clearDisplay();
@@ -607,12 +777,33 @@ void setup()
     udpDiscovery.begin(ALPACA_DISCOVERY_PORT);
     Serial.printf("Alpaca discovery on UDP port %d\n", ALPACA_DISCOVERY_PORT);
 
+    // Hardware task watchdog — armed last so a slow setup() can't trip it.
+    // If loop() stops feeding it for WDT_TIMEOUT_S the chip resets.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms     = WDT_TIMEOUT_S * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    // Core 3.x may already have initialised the TWDT — reconfigure in that case.
+    if (esp_task_wdt_init(&wdtCfg) == ESP_ERR_INVALID_STATE) {
+        esp_task_wdt_reconfigure(&wdtCfg);
+    }
+#else
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+    esp_task_wdt_add(NULL);   // watch the Arduino loop task
+    Serial.printf("Task watchdog armed (%d s)\n", WDT_TIMEOUT_S);
+
+    oledWake();
     updateOLED();
 }
 
 // ── loop() ────────────────────────────────────────────────────────────────────
 void loop()
 {
+    esp_task_wdt_reset();   // feed the hardware watchdog
+
     // Non-blocking relay pulse — turn off after RELAY_PULSE_MS
     if (s_relayActive && (millis() - s_relayStartMs >= RELAY_PULSE_MS)) {
         digitalWrite(RELAY_PIN, LOW);
@@ -626,9 +817,29 @@ void loop()
         s_motionState = MOTION_ERROR;
     }
 
+    maintainWifi();
+
     infoServer.handleClient();
     alpacaServer.handleClient();
     handleDiscovery();
+
+    // Wake the panel whenever the roof actually changes state
+    {
+        static ShutterStatus lastShutter = SHUTTER_ERROR;
+        static bool          haveLast    = false;
+        ShutterStatus now = getShutterStatus();
+        if (!haveLast || now != lastShutter) {
+            if (haveLast) oledWake();
+            lastShutter = now;
+            haveLast    = true;
+        }
+    }
+
+    // Drift the layout a few pixels so nothing stays lit forever
+    if (millis() - s_lastShiftMs >= OLED_SHIFT_INTERVAL_MS) {
+        s_oledShift  = (s_oledShift + 1) & 0x07;
+        s_lastShiftMs = millis();
+    }
 
     // Refresh OLED every 500 ms
     if (millis() - s_lastOledMs >= OLED_REFRESH_MS) {
