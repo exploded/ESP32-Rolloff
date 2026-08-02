@@ -62,7 +62,9 @@
 #include <WebServer.h>
 #include <WiFiUDP.h>
 #include <Wire.h>
+#include <time.h>
 #include <esp_task_wdt.h>
+#include <esp_system.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "wifi_credentials.h"
@@ -111,6 +113,12 @@
 #define BOOT_WIFI_REBEGIN_TRIES   30       // 30 × 500 ms = 15 s, then re-begin
 #define BOOT_WIFI_MAX_TRIES       60       // 60 × 500 ms = 30 s, then reboot
 
+// ── Time (house convention: Melbourne, DST handled by configTzTime) ───────────
+static const char *TZ_INFO      = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+static const char *NTP_SERVER_1 = "pool.ntp.org";
+static const char *NTP_SERVER_2 = "time.nist.gov";
+#define TIME_SYNCED_EPOCH  1704067200UL   // 2024-01-01; anything below = not synced
+
 // ── Ports ─────────────────────────────────────────────────────────────────────
 #define INFO_PORT              80
 #define ALPACA_HTTP_PORT    11111
@@ -151,6 +159,122 @@ unsigned long s_lastWifiCheckMs = 0;
 unsigned long s_wifiDownSinceMs = 0;   // 0 = link is up
 uint8_t       s_wifiRetries     = 0;
 uint32_t      s_wifiDropCount   = 0;   // reported on the info page
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+// Lives in RTC memory, which survives a software reset and a watchdog reset but
+// not a power cycle.  That's exactly what we want: if the device reboots itself
+// overnight the evidence is still there in the morning.  A power cycle
+// deliberately clears it, so the counters always mean "since mains was applied".
+#define DIAG_MAGIC   0x524F4C46UL   // "ROLF"
+#define DIAG_EVENTS  12
+
+enum DiagEvent : uint8_t {
+    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_OPEN, EV_CLOSE
+};
+
+struct DiagEntry {
+    uint32_t epoch;      // 0 if the clock wasn't synced yet
+    uint32_t uptimeSec;
+    uint8_t  type;
+};
+
+struct DiagRecord {
+    uint32_t  magic;
+    uint32_t  bootCount;
+    uint32_t  wifiDrops;   // cumulative across reboots, unlike s_wifiDropCount
+    uint8_t   head;
+    DiagEntry ev[DIAG_EVENTS];
+};
+
+RTC_NOINIT_ATTR DiagRecord s_diag;
+
+const char *diagEventName(uint8_t t)
+{
+    switch (t) {
+        case EV_BOOT:      return "boot";
+        case EV_WIFI_LOST: return "WiFi lost";
+        case EV_WIFI_OK:   return "WiFi recovered";
+        case EV_REBOOT:    return "self-reboot";
+        case EV_OPEN:      return "open cmd";
+        case EV_CLOSE:     return "close cmd";
+        default:           return "";
+    }
+}
+
+const char *resetReasonName()
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  return "power-on";
+        case ESP_RST_SW:       return "software restart";
+        case ESP_RST_PANIC:    return "panic / exception";
+        case ESP_RST_TASK_WDT: return "TASK WATCHDOG";
+        case ESP_RST_INT_WDT:  return "interrupt watchdog";
+        case ESP_RST_WDT:      return "other watchdog";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (power dip)";
+        case ESP_RST_EXT:      return "external reset pin";
+        case ESP_RST_DEEPSLEEP:return "deep sleep wake";
+        default:               return "unknown";
+    }
+}
+
+void diagLog(DiagEvent type)
+{
+    DiagEntry &e = s_diag.ev[s_diag.head];
+    time_t now   = time(nullptr);
+    e.epoch      = (now > (time_t)TIME_SYNCED_EPOCH) ? (uint32_t)now : 0;
+    e.uptimeSec  = millis() / 1000UL;
+    e.type       = (uint8_t)type;
+    s_diag.head  = (s_diag.head + 1) % DIAG_EVENTS;
+}
+
+// Local wall-clock string, or an uptime fallback when NTP hadn't synced yet.
+String diagWhen(const DiagEntry &e)
+{
+    if (e.epoch == 0) return "+" + String(e.uptimeSec) + "s (no clock)";
+    time_t t = (time_t)e.epoch;
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[24];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+    return String(buf);
+}
+
+// Diagnostics card for the info page — newest event first.
+String diagCardHtml()
+{
+    String h = "<div class='card'><h2>Diagnostics</h2>"
+               "<p><strong>Last reset:</strong> " + String(resetReasonName()) + "</p>"
+               "<p><strong>Boots since power-on:</strong> " + String(s_diag.bootCount) + "</p>"
+               "<p><strong>WiFi drops since power-on:</strong> " + String(s_diag.wifiDrops) + "</p>";
+
+    time_t now = time(nullptr);
+    h += "<p><strong>Clock:</strong> ";
+    if (now > (time_t)TIME_SYNCED_EPOCH) {
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+        h += buf;
+    } else {
+        h += "not synced";
+    }
+    h += "</p>";
+
+    h += "<table><tr><th align='left'>When</th><th align='left'>Event</th></tr>";
+    bool any = false;
+    for (int i = 0; i < DIAG_EVENTS; i++) {
+        // walk backwards from the most recently written slot
+        int idx = (s_diag.head - 1 - i + 2 * DIAG_EVENTS) % DIAG_EVENTS;
+        const DiagEntry &e = s_diag.ev[idx];
+        if (e.type == EV_NONE) continue;
+        any = true;
+        h += "<tr><td><code>" + diagWhen(e) + "</code></td><td>"
+             + String(diagEventName(e.type)) + "</td></tr>";
+    }
+    if (!any) h += "<tr><td colspan='2'>no events recorded</td></tr>";
+    h += "</table></div>";
+    return h;
+}
 
 // OLED burn-in state
 unsigned long s_oledActivityMs = 0;    // last time something worth showing happened
@@ -292,6 +416,7 @@ void safeRestart(const char *reason)
     }
 
     Serial.printf("Restarting: %s\n", reason);
+    diagLog(EV_REBOOT);
     if (s_oledOk) {
         display.clearDisplay();
         display.setTextSize(1);
@@ -317,6 +442,7 @@ void maintainWifi()
         if (s_wifiDownSinceMs != 0) {
             Serial.print("WiFi recovered, IP: ");
             Serial.println(WiFi.localIP());
+            diagLog(EV_WIFI_OK);
             oledWake();
         }
         s_wifiDownSinceMs = 0;
@@ -329,7 +455,9 @@ void maintainWifi()
         s_wifiDownSinceMs = millis();
         s_wifiRetries     = 0;
         s_wifiDropCount++;
+        s_diag.wifiDrops++;
         Serial.println("WiFi link lost — reconnecting");
+        diagLog(EV_WIFI_LOST);
         oledWake();   // a drop is worth lighting the panel for
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -455,6 +583,7 @@ void handleDomePut()
             s_lastCommand   = LAST_CMD_OPEN;
             s_motionState   = MOTION_OPENING;
             s_motionStartMs = millis();
+            diagLog(EV_OPEN);
             triggerRelayPulse();
         }
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
@@ -464,6 +593,7 @@ void handleDomePut()
             s_lastCommand   = LAST_CMD_CLOSE;
             s_motionState   = MOTION_CLOSING;
             s_motionStartMs = millis();
+            diagLog(EV_CLOSE);
             triggerRelayPulse();
         }
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
@@ -552,6 +682,8 @@ void handleInfoRoot()
              "cursor:pointer;font-size:1em}"
         ".open{background:#28a745;color:#fff}"
         ".close{background:#dc3545;color:#fff}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{padding:4px 8px;border-bottom:1px solid #eee;font-size:.9em}"
         "</style>"
         "</head><body>"
         "<h1>Rolloff Roof Controller</h1>"
@@ -573,6 +705,7 @@ void handleInfoRoot()
         "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
         "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
         "</div>"
+        + diagCardHtml() +
         "<div class='card'>"
         "<h2>Controls</h2>"
         "<button class='btn open'  onclick='sendCmd(\"openshutter\")'>Open Roof</button>"
@@ -623,6 +756,17 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println("\n\nESP32 Rolloff Alpaca Driver starting...");
+
+    // Diagnostics record — RTC memory is garbage after a power cycle, so gate on
+    // both the magic and the reset reason before trusting it.
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (s_diag.magic != DIAG_MAGIC || rr == ESP_RST_POWERON) {
+        memset(&s_diag, 0, sizeof(s_diag));
+        s_diag.magic = DIAG_MAGIC;
+    }
+    s_diag.bootCount++;
+    Serial.printf("Reset reason: %s (boot #%lu)\n", resetReasonName(),
+                  (unsigned long)s_diag.bootCount);
 
     // GPIO
     pinMode(LIMIT_SWITCH_CLOSED, INPUT_PULLUP);
@@ -721,6 +865,11 @@ void setup()
     Serial.println();
     Serial.print("Connected!  IP: ");
     Serial.println(WiFi.localIP());
+
+    // NTP — non-blocking, syncs in the background.  Only needed so the event log
+    // carries wall-clock times that line up with NINA's log.
+    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+    diagLog(EV_BOOT);
 
     // Info server — port 80
     infoServer.on("/", HTTP_GET, handleInfoRoot);
