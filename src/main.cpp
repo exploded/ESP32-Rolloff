@@ -160,12 +160,36 @@ unsigned long s_wifiDownSinceMs = 0;   // 0 = link is up
 uint8_t       s_wifiRetries     = 0;
 uint32_t      s_wifiDropCount   = 0;   // reported on the info page
 
+// Set from the WiFi event task, consumed in loop().  The handler must stay this
+// trivial: WiFi.begin()/disconnect() must not be called from the event context,
+// so all it does is raise a flag that forces the next poll to run immediately.
+volatile bool    s_wifiEvtDisconnected = false;
+volatile bool    s_wifiEvtGotIp        = false;
+volatile uint8_t s_wifiDisconnectReason = 0;
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            s_wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+            s_wifiEvtDisconnected  = true;
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            s_wifiEvtGotIp = true;
+            break;
+        default:
+            break;
+    }
+}
+
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 // Lives in RTC memory, which survives a software reset and a watchdog reset but
 // not a power cycle.  That's exactly what we want: if the device reboots itself
 // overnight the evidence is still there in the morning.  A power cycle
 // deliberately clears it, so the counters always mean "since mains was applied".
-#define DIAG_MAGIC   0x524F4C46UL   // "ROLF"
+// Bump the magic whenever the layout below changes, otherwise a reflash can find
+// stale RTC contents that still match the old magic and decode as garbage.
+#define DIAG_MAGIC   0x524F4C47UL   // "ROLG" — rev 2, DiagEntry gained `detail`
 #define DIAG_EVENTS  12
 
 enum DiagEvent : uint8_t {
@@ -176,6 +200,7 @@ struct DiagEntry {
     uint32_t epoch;      // 0 if the clock wasn't synced yet
     uint32_t uptimeSec;
     uint8_t  type;
+    uint8_t  detail;     // EV_WIFI_LOST: the 802.11 disconnect reason code
 };
 
 struct DiagRecord {
@@ -217,14 +242,34 @@ const char *resetReasonName()
     }
 }
 
-void diagLog(DiagEvent type)
+void diagLog(DiagEvent type, uint8_t detail = 0)
 {
     DiagEntry &e = s_diag.ev[s_diag.head];
     time_t now   = time(nullptr);
     e.epoch      = (now > (time_t)TIME_SYNCED_EPOCH) ? (uint32_t)now : 0;
     e.uptimeSec  = millis() / 1000UL;
     e.type       = (uint8_t)type;
+    e.detail     = detail;
     s_diag.head  = (s_diag.head + 1) % DIAG_EVENTS;
+}
+
+// The common 802.11 reason codes, so the log reads without a lookup table.
+// 15 in particular means the AP's group-key rotation timed out — a classic
+// cause of a single unexplained nightly drop.
+const char *wifiReasonName(uint8_t r)
+{
+    switch (r) {
+        case 1:   return "unspecified";
+        case 2:   return "auth expired";
+        case 4:   return "assoc expired (AP idle timeout)";
+        case 8:   return "AP deauthenticated us";
+        case 15:  return "4-way handshake timeout (group rekey)";
+        case 200: return "beacon timeout (AP unreachable)";
+        case 201: return "no AP found";
+        case 202: return "auth failed";
+        case 203: return "assoc failed";
+        default:  return "";
+    }
 }
 
 // Local wall-clock string, or an uptime fallback when NTP hadn't synced yet.
@@ -268,8 +313,13 @@ String diagCardHtml()
         const DiagEntry &e = s_diag.ev[idx];
         if (e.type == EV_NONE) continue;
         any = true;
-        h += "<tr><td><code>" + diagWhen(e) + "</code></td><td>"
-             + String(diagEventName(e.type)) + "</td></tr>";
+        String what = diagEventName(e.type);
+        if (e.type == EV_WIFI_LOST) {
+            what += " — reason " + String(e.detail);
+            const char *rn = wifiReasonName(e.detail);
+            if (rn[0]) what += " (" + String(rn) + ")";
+        }
+        h += "<tr><td><code>" + diagWhen(e) + "</code></td><td>" + what + "</td></tr>";
     }
     if (!any) h += "<tr><td colspan='2'>no events recorded</td></tr>";
     h += "</table></div>";
@@ -435,6 +485,16 @@ void safeRestart(const char *reason)
 // Polled from loop().  Escalates: notice the drop → re-associate → reboot.
 void maintainWifi()
 {
+    // The driver knows about a drop long before a 5 s poll would notice.  Rather
+    // than duplicate the recovery logic, just force the poll below to run now —
+    // shrinking a ~10 s outage to ~2 s, which may be short enough that clients
+    // like NINA never see a failed request.
+    if (s_wifiEvtDisconnected || s_wifiEvtGotIp) {
+        s_wifiEvtDisconnected = false;
+        s_wifiEvtGotIp        = false;
+        s_lastWifiCheckMs     = 0;   // millis() - 0 always exceeds the interval
+    }
+
     if (millis() - s_lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) return;
     s_lastWifiCheckMs = millis();
 
@@ -456,8 +516,10 @@ void maintainWifi()
         s_wifiRetries     = 0;
         s_wifiDropCount++;
         s_diag.wifiDrops++;
-        Serial.println("WiFi link lost — reconnecting");
-        diagLog(EV_WIFI_LOST);
+        uint8_t reason = s_wifiDisconnectReason;
+        Serial.printf("WiFi link lost (reason %u %s) — reconnecting\n",
+                      reason, wifiReasonName(reason));
+        diagLog(EV_WIFI_LOST, reason);
         oledWake();   // a drop is worth lighting the panel for
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -824,6 +886,7 @@ void setup()
     WiFi.setSleep(false);          // modem sleep makes the link flaky under polling
     WiFi.setAutoReconnect(true);   // first line of defence; maintainWifi() backs it up
     WiFi.setHostname("rolloff");
+    WiFi.onEvent(onWiFiEvent);     // must be registered before begin()
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
     {
