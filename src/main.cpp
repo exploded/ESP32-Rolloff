@@ -60,7 +60,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WiFiUDP.h>
+#include <AsyncUDP.h>   // in the ESP32 core; unrelated to AsyncTCP, no lib_deps
 #include <Wire.h>
 #include <time.h>
 #include <esp_task_wdt.h>
@@ -144,7 +144,9 @@ public:
 
 GuardedWebServer infoServer(INFO_PORT);
 GuardedWebServer alpacaServer(ALPACA_HTTP_PORT);
-WiFiUDP          udpDiscovery;
+AsyncUDP         udpDiscovery;
+
+void startDiscovery();   // defined below; re-armed by the WiFi supervisor
 
 bool s_oledOk = false;
 
@@ -608,6 +610,7 @@ void maintainWifi()
             Serial.println(WiFi.localIP());
             diagLog(EV_WIFI_OK);
             oledWake();
+            startDiscovery();   // the UDP socket does not survive re-association
         }
         s_wifiDownSinceMs = 0;
         s_wifiRetries     = 0;
@@ -966,23 +969,30 @@ void handleDiagPage()
 }
 
 // ── Alpaca UDP discovery ──────────────────────────────────────────────────────
-void handleDiscovery()
+// Callback-driven rather than polled.  The old WiFiUDP version called
+// parsePacket() on every loop() iteration, and that does a malloc(1460) + free()
+// each time — by far the largest source of allocator churn in this firmware, and
+// the most likely cause of any heap fragmentation.  The callback runs in the
+// lwIP task but touches nothing loop() owns, so there is no race.
+// The socket does not survive a re-association, so this is re-armed from
+// maintainWifi() whenever the link comes back.
+void startDiscovery()
 {
-    int pktLen = udpDiscovery.parsePacket();
-    if (pktLen <= 0) return;
-
-    char buf[64];
-    int n = udpDiscovery.read(buf, sizeof(buf) - 1);
-    if (n <= 0) return;
-    buf[n] = '\0';
-
-    if (strncmp(buf, "alpacadiscovery1", 16) == 0) {
-        char resp[64];
-        snprintf(resp, sizeof(resp), "{\"AlpacaPort\":%d}", ALPACA_HTTP_PORT);
-        udpDiscovery.beginPacket(udpDiscovery.remoteIP(), udpDiscovery.remotePort());
-        udpDiscovery.print(resp);
-        udpDiscovery.endPacket();
+    udpDiscovery.close();
+    if (!udpDiscovery.listen(ALPACA_DISCOVERY_PORT)) {
+        Serial.println("Alpaca discovery: listen FAILED");
+        return;
     }
+    udpDiscovery.onPacket([](AsyncUDPPacket packet) {
+        if (packet.length() < 16) return;
+        if (strncmp((const char *)packet.data(), "alpacadiscovery1", 16) != 0) return;
+        // The reply must carry ONLY AlpacaPort.  The RG-11 safety monitor
+        // records that adding a Devices array makes NINA silently drop the
+        // device — do not "improve" this payload.
+        char resp[40];
+        snprintf(resp, sizeof(resp), "{\"AlpacaPort\":%d}", ALPACA_HTTP_PORT);
+        packet.print(resp);
+    });
 }
 
 // ── setup() ───────────────────────────────────────────────────────────────────
@@ -1167,7 +1177,7 @@ void setup()
     Serial.printf("Alpaca server on port %d\n", ALPACA_HTTP_PORT);
 
     // Alpaca UDP discovery
-    udpDiscovery.begin(ALPACA_DISCOVERY_PORT);
+    startDiscovery();
     Serial.printf("Alpaca discovery on UDP port %d\n", ALPACA_DISCOVERY_PORT);
 
     // Hardware task watchdog — armed last so a slow setup() can't trip it.
@@ -1217,7 +1227,7 @@ void loop()
 
     infoServer.handleClient();
     alpacaServer.handleClient();
-    handleDiscovery();
+    // discovery is callback-driven now — nothing to poll here
 
     // Roll the request-rate window
     if (millis() - s_windowStartMs >= REQ_WINDOW_MS) {
