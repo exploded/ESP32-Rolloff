@@ -113,6 +113,11 @@
 #define BOOT_WIFI_REBEGIN_TRIES   30       // 30 × 500 ms = 15 s, then re-begin
 #define BOOT_WIFI_MAX_TRIES       60       // 60 × 500 ms = 30 s, then reboot
 
+// ── HTTP instrumentation ──────────────────────────────────────────────────────
+#define HEARTBEAT_MS       (30UL * 1000UL)        // serial status line
+#define REQ_WINDOW_MS      (60UL * 1000UL)        // rolling request-rate window
+#define NET_STALL_MS       (10UL * 60UL * 1000UL) // log-only: no requests at all
+
 // ── Time (house convention: Melbourne, DST handled by configTzTime) ───────────
 static const char *TZ_INFO      = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 static const char *NTP_SERVER_1 = "pool.ntp.org";
@@ -127,9 +132,19 @@ static const char *NTP_SERVER_2 = "time.nist.gov";
 // ── Globals ───────────────────────────────────────────────────────────────────
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-WebServer infoServer(INFO_PORT);
-WebServer alpacaServer(ALPACA_HTTP_PORT);
-WiFiUDP   udpDiscovery;
+// WiFiServer::begin() returns void and fails silently: on a failed socket/bind/
+// listen it leaves _listening false and available() then returns nothing for
+// ever, leaving the device pingable but permanently unable to serve.  WebServer
+// keeps its WiFiServer protected, so expose its liveness rather than guess.
+class GuardedWebServer : public WebServer {
+public:
+    using WebServer::WebServer;
+    bool isListening() { return (bool)_server; }
+};
+
+GuardedWebServer infoServer(INFO_PORT);
+GuardedWebServer alpacaServer(ALPACA_HTTP_PORT);
+WiFiUDP          udpDiscovery;
 
 bool s_oledOk = false;
 
@@ -197,7 +212,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
 // DiagEntry's layout, so DIAG_MAGIC does not need bumping for this.
 enum DiagEvent : uint8_t {
     EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_OPEN, EV_CLOSE,
-    EV_ABORT
+    EV_ABORT, EV_NET_STALL
 };
 
 struct DiagEntry {
@@ -227,6 +242,7 @@ const char *diagEventName(uint8_t t)
         case EV_OPEN:      return "open cmd";
         case EV_CLOSE:     return "close cmd";
         case EV_ABORT:     return "abort cmd";
+        case EV_NET_STALL: return "no requests";
         default:           return "";
     }
 }
@@ -329,6 +345,28 @@ String diagCardHtml()
     if (!any) h += "<tr><td colspan='2'>no events recorded</td></tr>";
     h += "</table></div>";
     return h;
+}
+
+// ── HTTP serving instrumentation ──────────────────────────────────────────────
+// The failure being chased is TCP-level: requests never reach a handler at all.
+// So the fingerprint is both servers' request counts going flat together while
+// uptime and RSSI keep advancing.  Counters are RAM-only — the RTC log carries
+// the events that need to survive a reboot.
+uint32_t      s_infoRequests    = 0;
+uint32_t      s_alpacaRequests  = 0;
+unsigned long s_lastRequestMs   = 0;
+uint32_t      s_recentRequests  = 0;   // completed 60 s window
+uint32_t      s_windowCount     = 0;   // window in progress
+unsigned long s_windowStartMs   = 0;
+unsigned long s_lastHeartbeatMs = 0;
+bool          s_stallLogged     = false;
+
+void noteRequest(bool alpaca)
+{
+    if (alpaca) s_alpacaRequests++; else s_infoRequests++;
+    s_lastRequestMs = millis();
+    s_windowCount++;
+    s_stallLogged   = false;   // re-arm the stall detector
 }
 
 // OLED burn-in state
@@ -715,6 +753,7 @@ void handleDomePut()
 // ── Management ────────────────────────────────────────────────────────────────
 void handleManagement()
 {
+    noteRequest(true);
     uint32_t clientTx = alpacaClientTx();
     String path = alpacaServer.uri();
 
@@ -744,6 +783,7 @@ void handleManagement()
 // warning is never triggered.
 void handleDomeAny()
 {
+    noteRequest(true);
     HTTPMethod m = alpacaServer.method();
     if (m == HTTP_OPTIONS) { addCorsHeaders(alpacaServer); alpacaServer.send(200); return; }
     if (m == HTTP_GET)     { handleDomeGet(); return; }
@@ -757,6 +797,7 @@ void handleDomeAny()
 // on the Alpaca server so the browser preflight succeeds.
 void handleInfoRoot()
 {
+    noteRequest(false);
     oledWake();   // someone is looking at the device
 
     bool closedActive = (digitalRead(LIMIT_SWITCH_CLOSED) == LOW);
@@ -800,6 +841,17 @@ void handleInfoRoot()
         "<p><strong>WiFi RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>"
         "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
         "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
+        "<p><strong>Largest free block:</strong> " + String(ESP.getMaxAllocHeap()) + " bytes</p>"
+        "<p><strong>Lowest free heap ever:</strong> " + String(ESP.getMinFreeHeap()) + " bytes</p>"
+        "<p><strong>Requests (info/alpaca):</strong> " + String(s_infoRequests)
+            + " / " + String(s_alpacaRequests) + "</p>"
+        "<p><strong>Request rate:</strong> " + String(s_recentRequests) + " /min</p>"
+        "<p><strong>Last request:</strong> "
+            + (s_lastRequestMs ? String((millis() - s_lastRequestMs) / 1000UL) + " s ago"
+                               : String("never")) + "</p>"
+        "<p><strong>Listeners up (info/alpaca):</strong> "
+            + (infoServer.isListening()   ? "yes" : "<b>NO</b>") + " / "
+            + (alpacaServer.isListening() ? "yes" : "<b>NO</b>") + "</p>"
         "</div>"
         + diagCardHtml() +
         "<div class='card'>"
@@ -1071,6 +1123,39 @@ void loop()
     infoServer.handleClient();
     alpacaServer.handleClient();
     handleDiscovery();
+
+    // Roll the request-rate window
+    if (millis() - s_windowStartMs >= REQ_WINDOW_MS) {
+        s_recentRequests = s_windowCount;
+        s_windowCount    = 0;
+        s_windowStartMs  = millis();
+    }
+
+    // Log-only stall detector.  Deliberately takes no action: a quiet device is
+    // indistinguishable from a wedged one without a client to compare against,
+    // and a roof controller that reboots itself on a guess is worse than one
+    // that is briefly unreachable.  Edge-triggered so a quiet day logs once.
+    if (!s_stallLogged && s_lastRequestMs != 0 &&
+        (millis() - s_lastRequestMs) > NET_STALL_MS) {
+        s_stallLogged = true;
+        diagLog(EV_NET_STALL, (uint8_t)((millis() - s_lastRequestMs) / 60000UL));
+        Serial.printf("No HTTP requests for %lu min (listening: info=%d alpaca=%d)\n",
+                      (millis() - s_lastRequestMs) / 60000UL,
+                      infoServer.isListening(), alpacaServer.isListening());
+    }
+
+    // Serial heartbeat — the fingerprint of the fault is both request counts
+    // going flat together while uptime and RSSI keep advancing.
+    if (millis() - s_lastHeartbeatMs >= HEARTBEAT_MS) {
+        s_lastHeartbeatMs = millis();
+        Serial.printf("up=%lumin rssi=%d req(info/alpaca)=%lu/%lu rate=%lu/min "
+                      "listen=%d/%d heap=%u maxblk=%u minfree=%u\n",
+                      millis() / 60000UL, WiFi.RSSI(),
+                      (unsigned long)s_infoRequests, (unsigned long)s_alpacaRequests,
+                      (unsigned long)s_recentRequests,
+                      infoServer.isListening(), alpacaServer.isListening(),
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+    }
 
     // Wake the panel whenever the roof actually changes state
     {
