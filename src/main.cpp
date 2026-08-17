@@ -339,25 +339,22 @@ void oledWake()
 }
 
 // ── Shutter logic ─────────────────────────────────────────────────────────────
+// getShutterStatus() is a PURE read — it must never mutate motion state.  It is
+// called from HTTP handlers, from updateOLED() and from loop(), and safeRestart()
+// reads the same motion state to decide whether a reboot is safe.  When this
+// function still mutated, a GET on /slewing could change whether the device was
+// allowed to reboot.  All mutation now lives in updateMotionState(), called once
+// per loop() so the state can't shift underneath a reader.
 ShutterStatus getShutterStatus()
 {
     bool closedActive = (digitalRead(LIMIT_SWITCH_CLOSED) == LOW);
     bool openActive   = (digitalRead(LIMIT_SWITCH_OPEN)   == LOW);
 
-    if (closedActive && openActive) {
-        s_motionState = MOTION_ERROR;
-        s_lastCommand = LAST_CMD_NONE;
-        return SHUTTER_ERROR;
-    }
-    if (closedActive) {
-        s_motionState = MOTION_NONE;
-        if (s_lastCommand == LAST_CMD_CLOSE) s_lastCommand = LAST_CMD_NONE;
-        return SHUTTER_CLOSED;
-    }
+    if (closedActive && openActive) return SHUTTER_ERROR;
+    if (closedActive)               return SHUTTER_CLOSED;
     if (openActive) {
+        // Sitting on the open switch but commanded closed: still travelling.
         if (s_motionState == MOTION_CLOSING) return SHUTTER_CLOSING;
-        s_motionState = MOTION_NONE;
-        if (s_lastCommand == LAST_CMD_OPEN) s_lastCommand = LAST_CMD_NONE;
         return SHUTTER_OPEN;
     }
 
@@ -367,6 +364,29 @@ ShutterStatus getShutterStatus()
     if (s_lastCommand == LAST_CMD_OPEN)  return SHUTTER_OPENING;
     if (s_lastCommand == LAST_CMD_CLOSE) return SHUTTER_CLOSING;
     return SHUTTER_ERROR;
+}
+
+// The mutations that used to live inside getShutterStatus().  loop() only.
+void updateMotionState()
+{
+    bool closedActive = (digitalRead(LIMIT_SWITCH_CLOSED) == LOW);
+    bool openActive   = (digitalRead(LIMIT_SWITCH_OPEN)   == LOW);
+
+    if (closedActive && openActive) {      // both switches — wiring or roof fault
+        s_motionState = MOTION_ERROR;
+        s_lastCommand = LAST_CMD_NONE;
+        return;
+    }
+    if (closedActive) {
+        s_motionState = MOTION_NONE;
+        if (s_lastCommand == LAST_CMD_CLOSE) s_lastCommand = LAST_CMD_NONE;
+        return;
+    }
+    if (openActive) {
+        if (s_motionState == MOTION_CLOSING) return;   // leaving the open switch
+        s_motionState = MOTION_NONE;
+        if (s_lastCommand == LAST_CMD_OPEN) s_lastCommand = LAST_CMD_NONE;
+    }
 }
 
 bool isSlewing()
@@ -1021,6 +1041,9 @@ void loop()
         digitalWrite(RELAY_PIN, LOW);
         s_relayActive = false;
     }
+
+    // Sole owner of motion state — everything else only reads it
+    updateMotionState();
 
     // Movement timeout watchdog
     if ((s_motionState == MOTION_OPENING || s_motionState == MOTION_CLOSING) &&
