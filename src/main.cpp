@@ -457,6 +457,47 @@ const char* shutterLabel(ShutterStatus s)
     }
 }
 
+// ── Roof commands ─────────────────────────────────────────────────────────────
+// The single implementation behind both the Alpaca PUTs and the same-origin
+// /cmd endpoint, so the browser path and the NINA path can never diverge.
+// Returns false when the roof is already where it was asked to go.
+bool commandOpen()
+{
+    if (getShutterStatus() == SHUTTER_OPEN) return false;
+    s_lastCommand   = LAST_CMD_OPEN;
+    s_motionState   = MOTION_OPENING;
+    s_motionStartMs = millis();
+    diagLog(EV_OPEN);
+    triggerRelayPulse();
+    return true;
+}
+
+bool commandClose()
+{
+    if (getShutterStatus() == SHUTTER_CLOSED) return false;
+    s_lastCommand   = LAST_CMD_CLOSE;
+    s_motionState   = MOTION_CLOSING;
+    s_motionStartMs = millis();
+    diagLog(EV_CLOSE);
+    triggerRelayPulse();
+    return true;
+}
+
+// The relay is a toggle, so only pulse when the roof is actually travelling —
+// otherwise "abort" would start it.  Motion state is left for loop() to resolve
+// so safeRestart()'s motion guard stays armed.
+bool commandAbort()
+{
+    if (s_motionState != MOTION_OPENING && s_motionState != MOTION_CLOSING) {
+        s_lastCommand = LAST_CMD_NONE;
+        return false;
+    }
+    diagLog(EV_ABORT);
+    triggerRelayPulse();
+    s_lastCommand = LAST_CMD_NONE;
+    return true;
+}
+
 // ── OLED ──────────────────────────────────────────────────────────────────────
 // Layout (128x32 pixels, font size 1 = 6x8 px per character), all offset by
 // (dx, dy) so the image drifts slightly over time:
@@ -704,37 +745,15 @@ void handleDomePut()
         return sendAlpacaBool(alpacaServer, s_alpacaConnected, clientTx);
     }
     if (ep == "openshutter") {
-        if (getShutterStatus() != SHUTTER_OPEN) {
-            s_lastCommand   = LAST_CMD_OPEN;
-            s_motionState   = MOTION_OPENING;
-            s_motionStartMs = millis();
-            diagLog(EV_OPEN);
-            triggerRelayPulse();
-        }
+        commandOpen();
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
     }
     if (ep == "closeshutter") {
-        if (getShutterStatus() != SHUTTER_CLOSED) {
-            s_lastCommand   = LAST_CMD_CLOSE;
-            s_motionState   = MOTION_CLOSING;
-            s_motionStartMs = millis();
-            diagLog(EV_CLOSE);
-            triggerRelayPulse();
-        }
+        commandClose();
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
     }
     if (ep == "abortslew") {
-        // The relay is a TOGGLE, so an unconditional pulse would START a
-        // stopped roof — the opposite of an abort.  Only pulse when motion is
-        // actually in progress.  Motion state is left alone rather than forced
-        // to MOTION_ERROR: that used to disarm safeRestart()'s motion guard and
-        // allow a reboot mid-travel.  loop()'s limit switches and the movement
-        // timeout resolve the state from here.
-        if (s_motionState == MOTION_OPENING || s_motionState == MOTION_CLOSING) {
-            diagLog(EV_ABORT);
-            triggerRelayPulse();
-        }
-        s_lastCommand = LAST_CMD_NONE;
+        commandAbort();
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
     }
 
@@ -792,89 +811,156 @@ void handleDomeAny()
 }
 
 // ── Info page (port 80) ───────────────────────────────────────────────────────
-// The Open/Close buttons use window.location.hostname to build the URL so no
-// IP is hardcoded.  The PUT goes cross-origin to port 11111; CORS is enabled
-// on the Alpaca server so the browser preflight succeeds.
+// Served straight from flash: no String building, no per-request heap churn.
+// The page polls /status.json instead of reloading itself, and its buttons hit
+// /cmd on this same origin — so the browser never opens a connection to the
+// Alpaca port and never issues a CORS preflight.  The previous version reloaded
+// a ~4 kB page every 3 s, which on its own exceeded what the device can sustain:
+// lwIP has 16 TCP PCBs and each served request holds one for ~140 s
+// (FIN_WAIT_2 + TIME_WAIT), giving a budget of roughly 7 connections a minute.
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rolloff Roof</title><style>
+body{font-family:Arial,Helvetica,sans-serif;margin:24px;background:#f5f5f5;color:#222}
+h1{color:#333;font-size:1.5em}h2{font-size:1.1em;margin:0 0 8px}
+.card{padding:16px;margin:12px 0;border-radius:8px;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.1)}
+.btn{padding:10px 16px;margin-right:8px;border:none;border-radius:6px;cursor:pointer;font-size:1em}
+.open{background:#28a745;color:#fff}.close{background:#dc3545;color:#fff}
+.on{color:#dc3545;font-weight:bold}.off{color:#28a745}
+#msg{margin-left:10px}
+body.stale{opacity:.45}
+p{margin:6px 0}
+</style></head><body>
+<h1>Rolloff Roof Controller</h1>
+<div class="card"><h2>Status</h2>
+<p><b>Shutter:</b> <span id="sh">&hellip;</span></p>
+<p><b>Alpaca connected:</b> <span id="ac">&hellip;</span></p>
+<p><b>Closed switch (GPIO 32):</b> <span id="cs">&hellip;</span></p>
+<p><b>Open switch (GPIO 33):</b> <span id="os">&hellip;</span></p>
+</div>
+<div class="card"><h2>Controls</h2>
+<button class="btn open" onclick="cmd('open')">Open Roof</button>
+<button class="btn close" onclick="cmd('close')">Close Roof</button>
+<span id="msg"></span>
+</div>
+<div class="card"><h2>Link</h2>
+<p><b>Uptime:</b> <span id="up">&hellip;</span> min</p>
+<p><b>WiFi RSSI:</b> <span id="rs">&hellip;</span> dBm</p>
+<p><b>WiFi drops since boot:</b> <span id="wd">&hellip;</span></p>
+<p><b>Requests (info/alpaca):</b> <span id="rq">&hellip;</span></p>
+<p><b>Request rate:</b> <span id="rt">&hellip;</span> /min</p>
+<p><b>Free heap:</b> <span id="hp">&hellip;</span> bytes</p>
+<p><b>Largest free block:</b> <span id="mb">&hellip;</span> bytes</p>
+<p><b>Listeners up:</b> <span id="ls">&hellip;</span></p>
+</div>
+<p><a href="/diag">Diagnostics &amp; event log</a></p>
+<script>
+function T(i,v){document.getElementById(i).textContent=v;}
+function sw(i,a){var e=document.getElementById(i);e.textContent=a?"ACTIVE":"inactive";e.className=a?"on":"off";}
+function upd(){
+ fetch("/status.json",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+  document.body.classList.remove("stale");
+  T("sh",d.shutter);T("ac",d.connected?"Yes":"No");
+  sw("cs",d.closedSw);sw("os",d.openSw);
+  T("up",d.uptimeMin);T("rs",d.rssi);T("wd",d.drops);
+  T("rq",d.reqInfo+" / "+d.reqAlpaca);T("rt",d.rate);
+  T("hp",d.heap);T("mb",d.maxBlock);T("ls",d.listen?"yes":"NO");
+ }).catch(function(){document.body.classList.add("stale");});
+}
+function cmd(a){
+ T("msg","sending…");
+ fetch("/cmd?a="+a,{cache:"no-store"}).then(function(r){return r.text();})
+  .then(function(t){T("msg",t);setTimeout(upd,400);})
+  .catch(function(e){T("msg","failed: "+e);});
+}
+upd();setInterval(upd,10000);
+</script></body></html>
+)rawliteral";
+
 void handleInfoRoot()
 {
     noteRequest(false);
     oledWake();   // someone is looking at the device
+    infoServer.send_P(200, "text/html", INDEX_HTML);
+}
 
-    bool closedActive = (digitalRead(LIMIT_SWITCH_CLOSED) == LOW);
-    bool openActive   = (digitalRead(LIMIT_SWITCH_OPEN)   == LOW);
-    ShutterStatus status = getShutterStatus();
+// Small fixed-size JSON built with snprintf into a stack buffer — deliberately
+// no String, so polling this costs no heap and cannot fragment it.
+void handleStatusJson()
+{
+    noteRequest(false);
 
-    String closedColor = closedActive ? "#dc3545" : "#28a745";
-    String openColor   = openActive   ? "#dc3545" : "#28a745";
+    char buf[400];
+    snprintf(buf, sizeof(buf),
+        "{\"shutter\":\"%s\",\"connected\":%s,\"closedSw\":%s,\"openSw\":%s,"
+        "\"uptimeMin\":%lu,\"rssi\":%d,\"drops\":%lu,"
+        "\"reqInfo\":%lu,\"reqAlpaca\":%lu,\"rate\":%lu,"
+        "\"heap\":%lu,\"maxBlock\":%lu,\"listen\":%s}",
+        shutterLabel(getShutterStatus()),
+        s_alpacaConnected ? "true" : "false",
+        (digitalRead(LIMIT_SWITCH_CLOSED) == LOW) ? "true" : "false",
+        (digitalRead(LIMIT_SWITCH_OPEN)   == LOW) ? "true" : "false",
+        millis() / 60000UL,
+        (int)WiFi.RSSI(),
+        (unsigned long)s_wifiDropCount,
+        (unsigned long)s_infoRequests,
+        (unsigned long)s_alpacaRequests,
+        (unsigned long)s_recentRequests,
+        (unsigned long)ESP.getFreeHeap(),
+        (unsigned long)ESP.getMaxAllocHeap(),
+        (infoServer.isListening() && alpacaServer.isListening()) ? "true" : "false");
+
+    infoServer.send(200, "application/json", buf);
+}
+
+// Same-origin roof control.  Keeping this on port 80 means the browser makes no
+// cross-origin request and so no OPTIONS preflight — halving what each click
+// costs in connections.  CORS stays enabled on the Alpaca server for NINA and
+// any other third-party client.
+void handleCmd()
+{
+    noteRequest(false);
+    oledWake();
+
+    String a = infoServer.arg("a");
+    const char *msg;
+
+    if      (a == "open")  msg = commandOpen()  ? "opening"  : "already open";
+    else if (a == "close") msg = commandClose() ? "closing"  : "already closed";
+    else if (a == "abort") msg = commandAbort() ? "aborting" : "not moving";
+    else {
+        infoServer.send(400, "text/plain", "use ?a=open|close|abort");
+        return;
+    }
+    infoServer.send(200, "text/plain", msg);
+}
+
+// Diagnostics live on their own page so the main page stays small and cheap.
+// This one still builds a String, but it is only fetched when someone asks.
+void handleDiagPage()
+{
+    noteRequest(false);
 
     String html =
-        "<html><head>"
-        "<meta http-equiv='refresh' content='3'>"
-        "<style>"
-        "body{font-family:Arial,sans-serif;margin:40px;background:#f5f5f5}"
-        "h1{color:#333}"
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Rolloff Diagnostics</title><style>"
+        "body{font-family:Arial,Helvetica,sans-serif;margin:24px;background:#f5f5f5;color:#222}"
+        "h1{font-size:1.4em}h2{font-size:1.1em;margin:0 0 8px}"
         ".card{padding:16px;margin:12px 0;border-radius:8px;background:#fff;"
               "box-shadow:0 2px 6px rgba(0,0,0,.1)}"
-        ".btn{padding:10px 16px;margin-right:8px;border:none;border-radius:6px;"
-             "cursor:pointer;font-size:1em}"
-        ".open{background:#28a745;color:#fff}"
-        ".close{background:#dc3545;color:#fff}"
         "table{border-collapse:collapse;width:100%}"
-        "th,td{padding:4px 8px;border-bottom:1px solid #eee;font-size:.9em}"
-        "</style>"
-        "</head><body>"
-        "<h1>Rolloff Roof Controller</h1>"
-        "<div class='card'>"
-        "<h2>Status</h2>"
-        "<p><strong>Shutter:</strong> " + String(shutterLabel(status)) + "</p>"
-        "<p><strong>Alpaca Connected:</strong> " + (s_alpacaConnected ? "Yes" : "No") + "</p>"
-        "<p><strong>Closed switch (GPIO 32):</strong> "
-            "<span style='color:" + closedColor + ";'>"
-            + (closedActive ? "ACTIVE" : "inactive") + "</span></p>"
-        "<p><strong>Open switch (GPIO 33):</strong> "
-            "<span style='color:" + openColor + ";'>"
-            + (openActive ? "ACTIVE" : "inactive") + "</span></p>"
-        "</div>"
-        "<div class='card'>"
-        "<h2>Link</h2>"
-        "<p><strong>Uptime:</strong> " + String(millis() / 60000UL) + " min</p>"
-        "<p><strong>WiFi RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>"
-        "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
-        "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
-        "<p><strong>Largest free block:</strong> " + String(ESP.getMaxAllocHeap()) + " bytes</p>"
-        "<p><strong>Lowest free heap ever:</strong> " + String(ESP.getMinFreeHeap()) + " bytes</p>"
-        "<p><strong>Requests (info/alpaca):</strong> " + String(s_infoRequests)
-            + " / " + String(s_alpacaRequests) + "</p>"
-        "<p><strong>Request rate:</strong> " + String(s_recentRequests) + " /min</p>"
-        "<p><strong>Last request:</strong> "
-            + (s_lastRequestMs ? String((millis() - s_lastRequestMs) / 1000UL) + " s ago"
-                               : String("never")) + "</p>"
-        "<p><strong>Listeners up (info/alpaca):</strong> "
-            + (infoServer.isListening()   ? "yes" : "<b>NO</b>") + " / "
-            + (alpacaServer.isListening() ? "yes" : "<b>NO</b>") + "</p>"
-        "</div>"
+        "th,td{padding:4px 8px;border-bottom:1px solid #eee;font-size:.9em;text-align:left}"
+        "p{margin:6px 0}"
+        "</style></head><body><h1>Diagnostics</h1>"
         + diagCardHtml() +
-        "<div class='card'>"
-        "<h2>Controls</h2>"
-        "<button class='btn open'  onclick='sendCmd(\"openshutter\")'>Open Roof</button>"
-        "<button class='btn close' onclick='sendCmd(\"closeshutter\")'>Close Roof</button>"
-        "</div>"
-        "<div class='card'>"
-        "<h2>Alpaca</h2>"
+        "<div class='card'><h2>Alpaca</h2>"
         "<p>API base: <code>http://&lt;IP&gt;:" + String(ALPACA_HTTP_PORT) + "/api/v1/dome/0/</code></p>"
         "<p>Discovery UDP port: " + String(ALPACA_DISCOVERY_PORT) + "</p>"
+        "<p>Lowest free heap since boot: " + String(ESP.getMinFreeHeap()) + " bytes</p>"
         "</div>"
-        "<script>"
-        "function sendCmd(cmd){"
-          "var url='http://'+window.location.hostname+':" + String(ALPACA_HTTP_PORT) + "/api/v1/dome/0/'+cmd;"
-          "fetch(url,{method:'PUT',"
-            "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-            "body:'ClientID=1&ClientTransactionID='+Date.now()})"
-          ".then(()=>location.reload())"
-          ".catch(e=>alert('Error: '+e));"
-        "}"
-        "</script>"
-        "</body></html>";
+        "<p><a href='/'>&larr; back</a></p></body></html>";
 
     infoServer.send(200, "text/html", html);
 }
@@ -1025,10 +1111,14 @@ void setup()
     diagLog(EV_BOOT);
 
     // Info server — port 80
-    infoServer.on("/", HTTP_GET, handleInfoRoot);
+    infoServer.on("/",            HTTP_GET, handleInfoRoot);
+    infoServer.on("/status.json", HTTP_GET, handleStatusJson);
+    infoServer.on("/cmd",         HTTP_GET, handleCmd);
+    infoServer.on("/diag",        HTTP_GET, handleDiagPage);
     infoServer.on("/favicon.ico", HTTP_GET, []() { infoServer.send(204); });
     infoServer.onNotFound([]() { infoServer.send(404, "text/plain", "Not found"); });
     infoServer.begin();
+    if (!infoServer.isListening()) Serial.println("WARNING: info server failed to listen");
     Serial.printf("Info server on port %d\n", INFO_PORT);
 
     // Alpaca server — port 11111
@@ -1073,6 +1163,7 @@ void setup()
         alpacaServer.send(404, "text/plain", "Not found");
     });
     alpacaServer.begin();
+    if (!alpacaServer.isListening()) Serial.println("WARNING: alpaca server failed to listen");
     Serial.printf("Alpaca server on port %d\n", ALPACA_HTTP_PORT);
 
     // Alpaca UDP discovery
