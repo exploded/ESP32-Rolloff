@@ -928,6 +928,10 @@ void setup()
 
     // OLED (I2C on GPIO19=SCL, GPIO21=SDA)
     Wire.begin(OLED_SDA, OLED_SCL);
+    // 400 kHz: pushing the 512-byte framebuffer at the 100 kHz default blocks
+    // loop() for ~46 ms every 500 ms — ~9 % of the time accepting no
+    // connections.  The SSD1306 is rated for fast-mode I2C.
+    Wire.setClock(400000);
 
     // Scan I2C bus to find the OLED address.
     // Note: Adafruit SSD1306 begin() returns true even when no device is present
