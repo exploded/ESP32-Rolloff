@@ -192,8 +192,12 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
 #define DIAG_MAGIC   0x524F4C47UL   // "ROLG" — rev 2, DiagEntry gained `detail`
 #define DIAG_EVENTS  12
 
+// Appended to only — existing values must keep their numbers so an RTC record
+// written by an older build still decodes.  Adding a name does not change
+// DiagEntry's layout, so DIAG_MAGIC does not need bumping for this.
 enum DiagEvent : uint8_t {
-    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_OPEN, EV_CLOSE
+    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_OPEN, EV_CLOSE,
+    EV_ABORT
 };
 
 struct DiagEntry {
@@ -222,6 +226,7 @@ const char *diagEventName(uint8_t t)
         case EV_REBOOT:    return "self-reboot";
         case EV_OPEN:      return "open cmd";
         case EV_CLOSE:     return "close cmd";
+        case EV_ABORT:     return "abort cmd";
         default:           return "";
     }
 }
@@ -681,8 +686,17 @@ void handleDomePut()
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
     }
     if (ep == "abortslew") {
-        triggerRelayPulse();
-        s_motionState = MOTION_ERROR;
+        // The relay is a TOGGLE, so an unconditional pulse would START a
+        // stopped roof — the opposite of an abort.  Only pulse when motion is
+        // actually in progress.  Motion state is left alone rather than forced
+        // to MOTION_ERROR: that used to disarm safeRestart()'s motion guard and
+        // allow a reboot mid-travel.  loop()'s limit switches and the movement
+        // timeout resolve the state from here.
+        if (s_motionState == MOTION_OPENING || s_motionState == MOTION_CLOSING) {
+            diagLog(EV_ABORT);
+            triggerRelayPulse();
+        }
+        s_lastCommand = LAST_CMD_NONE;
         return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
     }
 
