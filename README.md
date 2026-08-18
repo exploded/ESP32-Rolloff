@@ -9,14 +9,39 @@ An ESP32-based controller for a rolloff observatory roof. Implements the [ASCOM 
 
 ## Features
 
-- ASCOM Alpaca Dome driver (interface version 3) on port **11111**
+- ASCOM Alpaca Dome driver (IDomeV2, interface version 2) on port **11111**
 - Alpaca UDP auto-discovery on port **32227** — no manual IP entry needed in N.I.N.A.
-- Browser control/status page on port **80** (auto-refreshes every 3 s)
+- Browser control/status page on port **80**, plus a diagnostics page at `/diag`
 - 0.91″ SSD1306 OLED showing shutter status and IP address
 - Two limit switches (OPEN and CLOSED positions)
 - Relay pulse (250 ms) to toggle the motor controller
 - 2-minute movement watchdog — sets error state if a limit switch is never reached
 - WiFi credentials kept in a gitignored file — safe to push to GitHub
+
+### Reliability
+
+The roof has to work unattended overnight, so several failure modes are handled
+explicitly:
+
+- **Persistent HTTP connections on the Alpaca port.** N.I.N.A. polls a dome
+  several times a second. Arduino's `WebServer` closes the connection after
+  every response, and lwIP holds each closed socket for about 140 seconds, so
+  the device can only sustain roughly 7 new connections a minute. Port 11111
+  therefore runs on ESP-IDF's `esp_http_server`, which keeps the connection
+  open — an entire session costs one connection instead of thousands. The
+  status page reports requests per connection so you can confirm it.
+- **Hardware task watchdog.** The chip resets if `loop()` stops running.
+- **WiFi supervisor.** Notices a dropped association from driver events,
+  re-associates, and reboots if it cannot recover. It never reboots while the
+  roof is moving.
+- **Diagnostics that survive a reboot.** Boots, WiFi drops with their 802.11
+  reason codes, and roof commands are logged to RTC memory, which outlives a
+  watchdog reset. A power cycle clears it deliberately, so the counters always
+  mean "since mains was applied".
+- **OLED burn-in mitigation.** Reduced drive current, a layout that drifts a
+  few pixels every minute, and a blank after 30 minutes idle.
+- **The display is optional.** If the I2C scan finds nothing, the device runs
+  normally without it.
 
 ---
 
@@ -77,7 +102,7 @@ The two limit-switch GPIOs (D32/D33) are adjacent on the right rail; the two OLE
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/<your-user>/ESP32-Rolloff.git
+git clone https://github.com/exploded/ESP32-Rolloff.git
 cd ESP32-Rolloff
 ```
 
@@ -115,7 +140,31 @@ Required libraries (installed automatically by PlatformIO via `platformio.ini`):
 
 ### Browser
 
-Open `http://<ESP32-IP>/` in any browser on the same network. The page shows shutter status, switch states, and Open / Close buttons. It auto-refreshes every 3 seconds.
+Open `http://<ESP32-IP>/` in any browser on the same network. The page shows shutter status, switch states, link health, and Open / Close buttons. It polls a small JSON endpoint every 10 seconds rather than reloading itself, so leaving a tab open costs the device very little.
+
+`http://<ESP32-IP>/diag` shows the reset reason, boot count, and the event log described under [Reliability](#reliability).
+
+| Path | Port | Purpose |
+|------|------|---------|
+| `/` | 80 | Status and control page |
+| `/status.json` | 80 | Status as JSON, polled by the page |
+| `/cmd?a=open\|close\|abort` | 80 | Same-origin roof control used by the buttons |
+| `/diag` | 80 | Diagnostics and event log |
+| `/api/v1/dome/0/…` | 11111 | ASCOM Alpaca Dome API |
+| `/management/…` | 11111 | Alpaca management API |
+
+### Monitoring
+
+`scripts/monitor-rolloff.ps1` logs availability and the device's own counters to
+a CSV. It is read-only and cannot move the roof. Run it on the observatory PC
+and leave it going:
+
+```powershell
+.\scripts\monitor-rolloff.ps1 -Ip <ESP32-IP>
+```
+
+It probes once a minute by design. Do not speed it up — a faster prober becomes
+a significant part of the load it is trying to measure.
 
 ### ASCOM Alpaca (N.I.N.A., Cartes du Ciel, etc.)
 
@@ -139,10 +188,17 @@ Connect at **115200 baud** to see startup messages including the assigned IP add
 ```
 ┌──────────────────────┐
 │ Rolloff Roof         │   ← title
-│ ▓▓▓▓OPEN▓▓▓▓▓▓▓▓▓▓▓  │   ← status on white bar (OPEN/CLOSED/OPENING/CLOSING/ERROR)
-│ 192.168.1.38         │   ← IP address
+│ ┌────┐               │   ← status in an outlined box
+│ │OPEN│               │     (OPEN/CLOSED/OPENING/CLOSING/ERROR)
+│ └────┘               │
+│ 192.168.1.38         │   ← IP address, or "WiFi lost 42s"
 └──────────────────────┘
 ```
+
+The status word sits in an outline rather than on a filled bar. A filled bar lit
+over a thousand pixels continuously, which was both the main burn-in source and
+a heavy enough load to sag the charge pump. The whole layout also shifts by a
+few pixels every minute so no pixel stays lit indefinitely.
 
 ---
 
