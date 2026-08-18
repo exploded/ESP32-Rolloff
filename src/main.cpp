@@ -956,7 +956,7 @@ void handleDiagPage()
         "table{border-collapse:collapse;width:100%}"
         "th,td{padding:4px 8px;border-bottom:1px solid #eee;font-size:.9em;text-align:left}"
         "p{margin:6px 0}"
-        "</style></head><body><h1>Diagnostics</h1>"
+        "</style></head><body><h1>Rolloff Roof Controller</h1>"
         + diagCardHtml() +
         "<div class='card'><h2>Alpaca</h2>"
         "<p>API base: <code>http://&lt;IP&gt;:" + String(ALPACA_HTTP_PORT) + "/api/v1/dome/0/</code></p>"
