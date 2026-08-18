@@ -1,9 +1,35 @@
 # ESP32 Rolloff Roof — ASCOM Alpaca Driver
 
-An ESP32-based controller for a rolloff observatory roof. Implements the [ASCOM Alpaca](https://ascom-standards.org/Developer/Alpaca.htm) Dome interface so any Alpaca-compatible astronomy application (N.I.N.A., Cartes du Ciel, etc.) can open, close, and monitor the roof. A built-in web page provides manual control from any browser on the local network.
+An ESP32-based controller for a rolloff observatory roof driven by a garage door opener. Implements the [ASCOM Alpaca](https://ascom-standards.org/Developer/Alpaca.htm) Dome interface so any Alpaca-compatible astronomy application (N.I.N.A., Cartes du Ciel, etc.) can open, close, and monitor the roof. A built-in web page provides manual control from any browser on the local network.
 
 ![OLED display showing OPEN status](demo-oled.jpeg)
 ![N.I.N.A. connected and web UI](demo-nina.png)
+
+---
+
+## How the roof is driven
+
+This driver is built for a roll-off roof pulled by a **standard garage door
+opener**, controlled the same way its wall button controls it: a **single
+momentary contact that both opens and closes**. There is no separate open input
+and close input. Each press cycles the opener through its sequence — move, stop,
+move back — and the relay imitates one press with a 250 ms pulse on GPIO 18.
+
+Everything unusual about the firmware follows from that one fact:
+
+- **The device cannot command a direction.** It can only say "press the button".
+  It infers what the roof is doing from the last command it issued and the two
+  limit switches.
+- **`AbortSlew` pulses only while the roof is actually moving.** On a toggle
+  input, pressing the button on a stationary roof would *start* it, so an abort
+  on a stopped roof deliberately does nothing.
+- **Opening an already-open roof does nothing.** The commands check the limit
+  switches first, because a stray pulse would close it.
+- **The two limit switches are the only ground truth.** Between them the roof's
+  position is unknown, which is why a 2-minute movement watchdog exists.
+
+If your opener exposes separate open and close inputs, or accepts a position
+command, this firmware needs modification rather than configuration.
 
 ---
 
@@ -52,7 +78,8 @@ explicitly:
 | ESP32 DevKit-C | 38-pin, USB-C (ESP32-WROOM-32) |
 | OLED display | 0.91″ SSD1306 I2C 128×32, address 0x3C |
 | Limit switch ×2 | Normally-open (NO) momentary switches |
-| Relay module | Single-channel, triggered by a logic-HIGH pulse |
+| Relay module | Single-channel, triggered by a logic-HIGH pulse. Its contacts wire across the garage door opener's wall-button terminals, in parallel with the existing button |
+| Garage door opener | Any opener driven by a single momentary contact that opens, stops, and closes in sequence |
 
 ---
 
@@ -87,7 +114,7 @@ GND
 |-----------|--------|-------|
 | GPIO 32 (D32) | Limit switch — CLOSED | Pull-up enabled; switch other terminal → GND |
 | GPIO 33 (D33) | Limit switch — OPEN   | Pull-up enabled; switch other terminal → GND |
-| GPIO 18 (D18) | Relay signal | Pulses HIGH for 250 ms |
+| GPIO 18 (D18) | Relay signal | Pulses HIGH for 250 ms, imitating one press of the opener's wall button |
 | GPIO 19 (D19) | OLED SCK (I2C clock) | Adjacent pair on board |
 | GPIO 21 (D21) | OLED SDA (I2C data)  | Adjacent pair on board |
 | 3V3 | OLED VCC | |
