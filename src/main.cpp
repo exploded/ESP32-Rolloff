@@ -60,6 +60,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <esp_http_server.h>   // Alpaca port only — see startAlpacaServer()
 #include <AsyncUDP.h>   // in the ESP32 core; unrelated to AsyncTCP, no lib_deps
 #include <Wire.h>
 #include <time.h>
@@ -143,10 +144,15 @@ public:
 };
 
 GuardedWebServer infoServer(INFO_PORT);
-GuardedWebServer alpacaServer(ALPACA_HTTP_PORT);
 AsyncUDP         udpDiscovery;
 
-void startDiscovery();   // defined below; re-armed by the WiFi supervisor
+// The Alpaca API does not use WebServer — see startAlpacaServer() for why.
+// Null means "not serving", which is the same liveness question isListening()
+// answers for port 80.
+httpd_handle_t   s_alpacaHttpd = nullptr;
+
+void startDiscovery();      // defined below; both are re-armed by the WiFi
+void startAlpacaServer();   // supervisor when the link comes back
 
 bool s_oledOk = false;
 
@@ -161,11 +167,28 @@ enum ShutterStatus {
 enum MotionState { MOTION_NONE = 0, MOTION_OPENING, MOTION_CLOSING, MOTION_ERROR };
 enum LastCommand  { LAST_CMD_NONE = 0, LAST_CMD_OPEN, LAST_CMD_CLOSE };
 
-MotionState   s_motionState     = MOTION_NONE;
-unsigned long s_motionStartMs   = 0;
-LastCommand   s_lastCommand     = LAST_CMD_NONE;
-bool          s_alpacaConnected = true;
-uint32_t      s_serverTxId      = 1;
+// The Alpaca HTTP handlers run on esp_http_server's own FreeRTOS task, so these
+// are read from a different task than the one that writes them.  Only loop()
+// ever writes the motion state; the HTTP side reads it and queues commands (see
+// s_pendingCmd).  Each is a single aligned word, so a reader sees either the old
+// or the new value, never a torn one.  getShutterStatus() does read the motion
+// state and the last command as a pair without locking, so it can briefly
+// report a status derived from a half-updated pair — self-correcting on the
+// next poll, and never used to make a movement decision.
+volatile MotionState   s_motionState     = MOTION_NONE;
+unsigned long          s_motionStartMs   = 0;   // loop() only
+volatile LastCommand   s_lastCommand     = LAST_CMD_NONE;
+volatile bool          s_alpacaConnected = true;
+uint32_t               s_serverTxId      = 1;   // bumped atomically
+
+// Roof commands arriving over Alpaca are queued here rather than executed on the
+// HTTP task.  loop() stays the sole mutator of motion state, the relay and the
+// diagnostics ring — the same discipline the WiFi event handler already follows.
+// One slot, last-write-wins: two commands inside a single loop() iteration are
+// under a millisecond apart, and coalescing them is both correct for a roof that
+// takes two minutes to travel and safer than pulsing a toggle relay twice.
+enum PendingCmd : uint8_t { PEND_NONE = 0, PEND_OPEN, PEND_CLOSE, PEND_ABORT };
+volatile uint8_t s_pendingCmd = PEND_NONE;
 
 bool          s_relayActive   = false;
 unsigned long s_relayStartMs  = 0;
@@ -361,13 +384,25 @@ uint32_t      s_recentRequests  = 0;   // completed 60 s window
 uint32_t      s_windowCount     = 0;   // window in progress
 unsigned long s_windowStartMs   = 0;
 unsigned long s_lastHeartbeatMs = 0;
-bool          s_stallLogged     = false;
+volatile bool s_stallLogged     = false;
+
+// TCP connections accepted on the Alpaca port, counted from inside the server.
+// This is the number that says whether the persistent-connection change is
+// actually working: requests per connection = Δs_alpacaRequests / Δs_alpacaConns.
+// One-per-request means something is still forcing a close; an observing session
+// should show hundreds.
+uint32_t      s_alpacaConns     = 0;
+
+// noteRequest() is now called from two tasks (loop() for port 80, the httpd task
+// for port 11111), so the increments have to be atomic or counts get lost.  The
+// timestamp and the flag are single words and need no more than that.
+static inline void bumpCounter(uint32_t &v) { __atomic_fetch_add(&v, 1, __ATOMIC_RELAXED); }
 
 void noteRequest(bool alpaca)
 {
-    if (alpaca) s_alpacaRequests++; else s_infoRequests++;
+    bumpCounter(alpaca ? s_alpacaRequests : s_infoRequests);
     s_lastRequestMs = millis();
-    s_windowCount++;
+    bumpCounter(s_windowCount);
     s_stallLogged   = false;   // re-arm the stall detector
 }
 
@@ -500,6 +535,31 @@ bool commandAbort()
     return true;
 }
 
+// Called from the HTTP task.  Does nothing but raise a flag — no relay, no
+// motion state, no diagnostics ring, all of which belong to loop().
+void queueCommand(PendingCmd c)
+{
+    s_pendingCmd = (uint8_t)c;
+}
+
+// Called from loop(), and only from loop().  ASCOM shutter commands are
+// asynchronous by specification — the client polls shutterstatus afterwards —
+// so deferring by one loop iteration is both spec-legal and far below what any
+// client could observe.
+void runPendingCommand()
+{
+    uint8_t c = s_pendingCmd;
+    if (c == PEND_NONE) return;
+    s_pendingCmd = PEND_NONE;
+
+    switch (c) {
+        case PEND_OPEN:  commandOpen();  break;
+        case PEND_CLOSE: commandClose(); break;
+        case PEND_ABORT: commandAbort(); break;
+        default: break;
+    }
+}
+
 // ── OLED ──────────────────────────────────────────────────────────────────────
 // Layout (128x32 pixels, font size 1 = 6x8 px per character), all offset by
 // (dx, dy) so the image drifts slightly over time:
@@ -611,6 +671,12 @@ void maintainWifi()
             diagLog(EV_WIFI_OK);
             oledWake();
             startDiscovery();   // the UDP socket does not survive re-association
+
+            // A listening TCP socket should survive re-association where the
+            // UDP one does not, but "should" is not worth a night of downtime.
+            // Restarting is free: the outage has already broken whatever
+            // persistent connection a client was holding.
+            startAlpacaServer();
         }
         s_wifiDownSinceMs = 0;
         s_wifiRetries     = 0;
@@ -648,169 +714,415 @@ void maintainWifi()
     s_wifiDownSinceMs = millis();
 }
 
-// ── Alpaca response helpers ───────────────────────────────────────────────────
-void addCorsHeaders(WebServer &srv)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Alpaca API (port 11111) — ESP-IDF esp_http_server
+// ─────────────────────────────────────────────────────────────────────────────
+//  Arduino's WebServer sends "Connection: close" on every response, so each
+//  request costs a fresh TCP connection.  lwIP is built here with 16 TCP PCBs
+//  and a 60 s MSL, and WebServer always performs the active close, so every
+//  served request holds a PCB for about 140 s (FIN_WAIT_2 + TIME_WAIT).  That
+//  is a budget of roughly seven connections a minute.  NINA polls a dome nine
+//  properties at a time, several times a second — 130 to 270 requests a minute,
+//  each its own connection — so the pool is permanently under pressure and
+//  tcp_alloc() spends its time reaping TIME_WAIT entries.  The symptom is not a
+//  refusal but multi-second latency spikes, which is exactly what the field
+//  fault looked like.
+//
+//  esp_http_server emits no Connection header at all, and HTTP/1.1 without one
+//  is persistent by RFC 7230.  ASCOM's client holds a pooled HttpClient and
+//  never asks to close, so an entire observing session now costs one connection
+//  instead of tens of thousands.  Verify with s_alpacaConns: requests per
+//  connection should be in the hundreds, not 1.
+//
+//  Port 80 deliberately stays on WebServer.  All the machine polling is here on
+//  11111, and leaving the browser page alone keeps the change small.  Note the
+//  PCB pool is still shared, so hammering port 80 can still slow this port —
+//  keep the browser poll interval long.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// esp_http_server does NOT copy header values, so every value passed here must
+// outlive the response.  String literals only — never a stack buffer.
+static void alpacaCors(httpd_req_t *req)
 {
-    srv.sendHeader("Access-Control-Allow-Origin",  "*");
-    srv.sendHeader("Access-Control-Allow-Methods", "GET, PUT, OPTIONS");
-    srv.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin",  "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, PUT, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
 }
 
-void sendAlpacaRaw(WebServer &srv, const String &valueJson,
-                   uint32_t clientTx, uint32_t errorNum, const String &errorMsg)
+// Every response is built with snprintf into a stack buffer.  The old String
+// version allocated five times per request; at NINA's polling rate that was the
+// firmware's largest source of heap churn, for no benefit — the envelope is a
+// fixed shape and always fits.
+static esp_err_t alpacaSend(httpd_req_t *req, const char *valueJson,
+                            uint32_t clientTx, uint32_t errorNum, const char *errorMsg)
 {
-    uint32_t serverTx = s_serverTxId++;
-    String resp =
-        "{\"ClientTransactionID\":" + String(clientTx) +
-        ",\"ServerTransactionID\":"  + String(serverTx) +
-        ",\"ErrorNumber\":"          + String(errorNum) +
-        ",\"ErrorMessage\":\""       + errorMsg + "\"," + valueJson + "}";
-    addCorsHeaders(srv);
-    srv.send(200, "application/json", resp);
+    uint32_t serverTx = __atomic_fetch_add(&s_serverTxId, 1, __ATOMIC_RELAXED);
+    char resp[320];
+    snprintf(resp, sizeof(resp),
+             "{\"ClientTransactionID\":%lu,\"ServerTransactionID\":%lu,"
+             "\"ErrorNumber\":%lu,\"ErrorMessage\":\"%s\",%s}",
+             (unsigned long)clientTx, (unsigned long)serverTx,
+             (unsigned long)errorNum, errorMsg, valueJson);
+    alpacaCors(req);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
-void sendAlpacaBool(WebServer &srv, bool v, uint32_t clientTx)
+static esp_err_t alpacaBool(httpd_req_t *req, bool v, uint32_t clientTx)
 {
-    sendAlpacaRaw(srv, String("\"Value\":") + (v ? "true" : "false"), clientTx, 0, "");
+    return alpacaSend(req, v ? "\"Value\":true" : "\"Value\":false", clientTx, 0, "");
 }
 
-void sendAlpacaInt(WebServer &srv, int v, uint32_t clientTx)
+static esp_err_t alpacaInt(httpd_req_t *req, int v, uint32_t clientTx)
 {
-    sendAlpacaRaw(srv, "\"Value\":" + String(v), clientTx, 0, "");
+    char b[32];
+    snprintf(b, sizeof(b), "\"Value\":%d", v);
+    return alpacaSend(req, b, clientTx, 0, "");
 }
 
-void sendAlpacaString(WebServer &srv, const String &v, uint32_t clientTx)
+static esp_err_t alpacaStr(httpd_req_t *req, const char *v, uint32_t clientTx)
 {
-    sendAlpacaRaw(srv, "\"Value\":\"" + v + "\"", clientTx, 0, "");
+    char b[160];
+    snprintf(b, sizeof(b), "\"Value\":\"%s\"", v);
+    return alpacaSend(req, b, clientTx, 0, "");
 }
 
-void sendAlpacaArray(WebServer &srv, const String &json, uint32_t clientTx)
+// For values that are already JSON — arrays, objects, or null.
+static esp_err_t alpacaRaw(httpd_req_t *req, const char *valueJson, uint32_t clientTx)
 {
-    sendAlpacaRaw(srv, "\"Value\":" + json, clientTx, 0, "");
+    return alpacaSend(req, valueJson, clientTx, 0, "");
 }
 
-void sendAlpacaError(WebServer &srv, uint32_t clientTx, uint32_t errNum, const String &msg)
+static esp_err_t alpacaError(httpd_req_t *req, uint32_t clientTx,
+                             uint32_t errNum, const char *msg)
 {
-    sendAlpacaRaw(srv, "\"Value\":null", clientTx, errNum, msg);
+    return alpacaSend(req, "\"Value\":null", clientTx, errNum, msg);
 }
 
-uint32_t alpacaClientTx()
+// ── Request parsing ───────────────────────────────────────────────────────────
+// Case-insensitive lookup in an "a=1&b=2" string.  Alpaca parameter names are
+// case-insensitive, and query strings and form-urlencoded bodies share this
+// syntax, so one function serves both.  Values in this API are only booleans
+// and integers, so no percent-decoding is needed.
+static bool formValue(const char *src, const char *key, char *out, size_t outLen)
 {
-    String v = alpacaServer.arg("ClientTransactionID");
-    return v.length() ? (uint32_t)v.toInt() : 0;
+    if (!src || !*src) return false;
+    size_t klen = strlen(key);
+
+    for (const char *p = src; *p; ) {
+        const char *amp = strchr(p, '&');
+        const char *end = amp ? amp : p + strlen(p);
+        const char *eq  = (const char *)memchr(p, '=', (size_t)(end - p));
+
+        if (eq && (size_t)(eq - p) == klen && strncasecmp(p, key, klen) == 0) {
+            size_t vlen = (size_t)(end - eq - 1);
+            if (vlen >= outLen) vlen = outLen - 1;
+            memcpy(out, eq + 1, vlen);
+            out[vlen] = '\0';
+            return true;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return false;
 }
+
+// Gathers the request's parameters into one "a=1&b=2" buffer: query string
+// first, then the form-urlencoded body.  Alpaca allows a parameter in either,
+// and the body can only be read once, so a handler collects everything up front
+// and looks it up from there.
+static void alpacaParams(httpd_req_t *req, char *buf, size_t bufLen)
+{
+    size_t n = 0;
+    if (httpd_req_get_url_query_str(req, buf, bufLen) == ESP_OK) n = strlen(buf);
+    else buf[0] = '\0';
+
+    if (req->content_len > 0 && n + 1 < bufLen) {
+        if (n) buf[n++] = '&';
+        size_t room = bufLen - n - 1;
+        size_t want = req->content_len < room ? req->content_len : room;
+        size_t got  = 0;
+        while (got < want) {
+            int r = httpd_req_recv(req, buf + n + got, want - got);
+            if (r <= 0) break;          // timeout or peer closed — use what arrived
+            got += (size_t)r;
+        }
+        buf[n + got] = '\0';
+        // Any body beyond `want` is drained by httpd_req_delete() when the
+        // handler returns, so truncating here cannot leave unread bytes to
+        // desync the next request on a persistent connection.
+    }
+}
+
+static uint32_t alpacaClientTx(const char *params)
+{
+    char v[16];
+    if (!formValue(params, "ClientTransactionID", v, sizeof(v))) return 0;
+    return (uint32_t)strtoul(v, nullptr, 10);
+}
+
+// The endpoint name, lowercased, so "ShutterStatus" and "shutterstatus" both
+// match.  The path prefix ahead of it is still matched case-sensitively — httpd
+// routes case-sensitively too, so a mixed-case prefix would never reach here
+// anyway, and every ASCOM client sends it lowercase.
+// req->uri may or may not carry the query string depending on the IDF version,
+// so stop at '?' either way.
+static void alpacaEndpoint(httpd_req_t *req, const char *prefix,
+                           char *out, size_t outLen)
+{
+    const char *p    = req->uri;
+    size_t      plen = strlen(prefix);
+    if (strncmp(p, prefix, plen) == 0) p += plen;
+
+    size_t i = 0;
+    while (p[i] && p[i] != '?' && i < outLen - 1) {
+        out[i] = (char)tolower((unsigned char)p[i]);
+        i++;
+    }
+    out[i] = '\0';
+}
+
+#define DOME_PREFIX "/api/v1/dome/0/"
 
 // ── Dome GET ──────────────────────────────────────────────────────────────────
-void handleDomeGet()
+// Runs on the httpd task.  Every branch here is a pure read: digitalRead(), the
+// motion state, and constants.  Nothing in this function may mutate roof state.
+static esp_err_t handleDomeGet(httpd_req_t *req)
 {
-    uint32_t clientTx = alpacaClientTx();
-    String ep = alpacaServer.uri().substring(String("/api/v1/dome/0/").length());
+    noteRequest(true);
 
-    if (ep == "connected")        return sendAlpacaBool  (alpacaServer, s_alpacaConnected, clientTx);
-    if (ep == "description")      return sendAlpacaString(alpacaServer, "Rolloff roof Alpaca dome driver", clientTx);
-    if (ep == "driverinfo")       return sendAlpacaString(alpacaServer, "ESP32 Alpaca Dome Driver", clientTx);
-    if (ep == "driverversion")    return sendAlpacaString(alpacaServer, "1.0", clientTx);
-    if (ep == "interfaceversion") return sendAlpacaInt   (alpacaServer, 3, clientTx);
-    if (ep == "name")             return sendAlpacaString(alpacaServer, "Rolloff Roof", clientTx);
-    if (ep == "supportedactions") return sendAlpacaArray (alpacaServer, "[]", clientTx);
+    char ep[48];
+    alpacaEndpoint(req, DOME_PREFIX, ep, sizeof(ep));
 
-    if (ep == "cansetshutter")    return sendAlpacaBool(alpacaServer, true,  clientTx);
-    if (ep == "canfindhome")      return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "canpark")          return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "cansetaltitude")   return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "cansetazimuth")    return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "cansetpark")       return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "canslave")         return sendAlpacaBool(alpacaServer, false, clientTx);
-    if (ep == "cansyncazimuth")   return sendAlpacaBool(alpacaServer, false, clientTx);
+    char params[256];
+    alpacaParams(req, params, sizeof(params));
+    uint32_t tx = alpacaClientTx(params);
 
-    if (ep == "shutterstatus")    return sendAlpacaInt (alpacaServer, (int)getShutterStatus(), clientTx);
-    if (ep == "slewing")          return sendAlpacaBool(alpacaServer, isSlewing(), clientTx);
-    if (ep == "slaved")           return sendAlpacaBool(alpacaServer, false, clientTx);
+    if (!strcmp(ep, "connected"))     return alpacaBool(req, s_alpacaConnected, tx);
+    if (!strcmp(ep, "description"))   return alpacaStr(req, "Rolloff roof Alpaca dome driver", tx);
+    if (!strcmp(ep, "driverinfo"))    return alpacaStr(req, "ESP32 Alpaca Dome Driver", tx);
+    if (!strcmp(ep, "driverversion")) return alpacaStr(req, "1.0", tx);
+    if (!strcmp(ep, "name"))          return alpacaStr(req, "Rolloff Roof", tx);
+    if (!strcmp(ep, "supportedactions")) return alpacaRaw(req, "\"Value\":[]", tx);
 
-    if (ep == "athome" || ep == "atpark")
-        return sendAlpacaError(alpacaServer, clientTx, 0x400, "PropertyNotImplementedException");
-    if (ep == "azimuth" || ep == "altitude")
-        return sendAlpacaError(alpacaServer, clientTx, 0x400, "PropertyNotImplementedException");
+    // IDomeV2 (ASCOM Platform 6).  This was 3, which claims IDomeV3 and so
+    // promises Platform 7's DeviceState, Connect, Disconnect and Connecting —
+    // none of which this driver implements.  NINA never asked for them, so the
+    // mismatch was latent, but any client that trusted the 3 would have got a
+    // 404.  Declare what is actually here.
+    if (!strcmp(ep, "interfaceversion")) return alpacaInt(req, 2, tx);
 
-    sendAlpacaError(alpacaServer, clientTx, 0x401, "InvalidValueException");
+    if (!strcmp(ep, "cansetshutter"))  return alpacaBool(req, true,  tx);
+    if (!strcmp(ep, "canfindhome"))    return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "canpark"))        return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "cansetaltitude")) return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "cansetazimuth"))  return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "cansetpark"))     return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "canslave"))       return alpacaBool(req, false, tx);
+    if (!strcmp(ep, "cansyncazimuth")) return alpacaBool(req, false, tx);
+
+    if (!strcmp(ep, "shutterstatus")) return alpacaInt (req, (int)getShutterStatus(), tx);
+    if (!strcmp(ep, "slewing"))       return alpacaBool(req, isSlewing(), tx);
+    if (!strcmp(ep, "slaved"))        return alpacaBool(req, false, tx);
+
+    if (!strcmp(ep, "athome")  || !strcmp(ep, "atpark") ||
+        !strcmp(ep, "azimuth") || !strcmp(ep, "altitude"))
+        return alpacaError(req, tx, 0x400, "PropertyNotImplementedException");
+
+    return alpacaError(req, tx, 0x401, "InvalidValueException");
 }
 
 // ── Dome PUT ──────────────────────────────────────────────────────────────────
-void handleDomePut()
+// Also on the httpd task, so the three movement commands only queue work for
+// loop() — see queueCommand().  The Alpaca response for a shutter command
+// carries no value, so nothing is lost by answering before the relay fires.
+static esp_err_t handleDomePut(httpd_req_t *req)
 {
-    uint32_t clientTx = alpacaClientTx();
-    String ep = alpacaServer.uri().substring(String("/api/v1/dome/0/").length());
+    noteRequest(true);
 
-    if (ep == "connected") {
-        String val = alpacaServer.arg("Connected");
-        if (val == "true"  || val == "True"  || val == "1") s_alpacaConnected = true;
-        if (val == "false" || val == "False" || val == "0") s_alpacaConnected = false;
-        return sendAlpacaBool(alpacaServer, s_alpacaConnected, clientTx);
-    }
-    if (ep == "openshutter") {
-        commandOpen();
-        return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
-    }
-    if (ep == "closeshutter") {
-        commandClose();
-        return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
-    }
-    if (ep == "abortslew") {
-        commandAbort();
-        return sendAlpacaRaw(alpacaServer, "\"Value\":null", clientTx, 0, "");
+    char ep[48];
+    alpacaEndpoint(req, DOME_PREFIX, ep, sizeof(ep));
+
+    char params[256];
+    alpacaParams(req, params, sizeof(params));
+    uint32_t tx = alpacaClientTx(params);
+
+    if (!strcmp(ep, "connected")) {
+        char v[16];
+        if (formValue(params, "Connected", v, sizeof(v))) {
+            if (!strcasecmp(v, "true")  || !strcmp(v, "1")) s_alpacaConnected = true;
+            if (!strcasecmp(v, "false") || !strcmp(v, "0")) s_alpacaConnected = false;
+        }
+        return alpacaBool(req, s_alpacaConnected, tx);
     }
 
-    if (ep == "action"        || ep == "commandblind" ||
-        ep == "commandbool"   || ep == "commandstring")
-        return sendAlpacaError(alpacaServer, clientTx, 0x400, "MethodNotImplementedException");
+    if (!strcmp(ep, "openshutter"))  { queueCommand(PEND_OPEN);  return alpacaRaw(req, "\"Value\":null", tx); }
+    if (!strcmp(ep, "closeshutter")) { queueCommand(PEND_CLOSE); return alpacaRaw(req, "\"Value\":null", tx); }
+    if (!strcmp(ep, "abortslew"))    { queueCommand(PEND_ABORT); return alpacaRaw(req, "\"Value\":null", tx); }
 
-    if (ep == "findhome"       || ep == "park"             || ep == "setpark"  ||
-        ep == "slewtoaltitude" || ep == "slewtoazimuth"    || ep == "synctoazimuth" ||
-        ep == "slaved")
-        return sendAlpacaError(alpacaServer, clientTx, 0x400, "MethodNotImplementedException");
+    if (!strcmp(ep, "action")      || !strcmp(ep, "commandblind") ||
+        !strcmp(ep, "commandbool") || !strcmp(ep, "commandstring") ||
+        !strcmp(ep, "findhome")    || !strcmp(ep, "park")          ||
+        !strcmp(ep, "setpark")     || !strcmp(ep, "slewtoaltitude")||
+        !strcmp(ep, "slewtoazimuth") || !strcmp(ep, "synctoazimuth") ||
+        !strcmp(ep, "slaved"))
+        return alpacaError(req, tx, 0x400, "MethodNotImplementedException");
 
-    sendAlpacaError(alpacaServer, clientTx, 0x401, "InvalidValueException");
+    return alpacaError(req, tx, 0x401, "InvalidValueException");
 }
 
 // ── Management ────────────────────────────────────────────────────────────────
-void handleManagement()
+static esp_err_t handleManagement(httpd_req_t *req)
 {
     noteRequest(true);
-    uint32_t clientTx = alpacaClientTx();
-    String path = alpacaServer.uri();
 
-    if (path == "/management/apiversions")
-        return sendAlpacaArray(alpacaServer, "[1]", clientTx);
+    char path[64];
+    alpacaEndpoint(req, "", path, sizeof(path));   // whole path, lowercased
 
-    if (path == "/management/v1/description") {
-        String desc =
-            "{\"ServerName\":\"ESP32 Alpaca\",\"Manufacturer\":\"Rolloff\","
-            "\"ManufacturerVersion\":\"1.0\",\"Location\":\"Observatory\"}";
-        return sendAlpacaRaw(alpacaServer, "\"Value\":" + desc, clientTx, 0, "");
-    }
-    if (path == "/management/v1/configureddevices") {
-        String devices =
-            "[{\"DeviceType\":\"Dome\",\"DeviceName\":\"Rolloff Roof\","
-            "\"DeviceNumber\":0,\"UniqueID\":\"ESP32-ROLLOFF-0\"}]";
-        return sendAlpacaArray(alpacaServer, devices, clientTx);
-    }
+    char params[192];
+    alpacaParams(req, params, sizeof(params));
+    uint32_t tx = alpacaClientTx(params);
 
-    addCorsHeaders(alpacaServer);
-    alpacaServer.send(404, "text/plain", "Not found");
+    if (!strcmp(path, "/management/apiversions"))
+        return alpacaRaw(req, "\"Value\":[1]", tx);
+
+    if (!strcmp(path, "/management/v1/description"))
+        return alpacaRaw(req,
+            "\"Value\":{\"ServerName\":\"ESP32 Alpaca\",\"Manufacturer\":\"Rolloff\","
+            "\"ManufacturerVersion\":\"1.0\",\"Location\":\"Observatory\"}", tx);
+
+    // UniqueID is the same on every board built from this firmware, so two of
+    // them on one network are indistinguishable to a client.  Left alone here
+    // deliberately: changing it makes NINA treat the device as a new one and
+    // the saved profile has to be re-pointed by hand.
+    if (!strcmp(path, "/management/v1/configureddevices"))
+        return alpacaRaw(req,
+            "\"Value\":[{\"DeviceType\":\"Dome\",\"DeviceName\":\"Rolloff Roof\","
+            "\"DeviceNumber\":0,\"UniqueID\":\"ESP32-ROLLOFF-0\"}]", tx);
+
+    alpacaCors(req);
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
 }
 
-// ── Alpaca dome route handler (GET + PUT + OPTIONS) ──────────────────────────
-// Registered explicitly for every /api/v1/dome/0/* path so WebServer always
-// has a non-null _currentHandler and the "request handler not found" log_e
-// warning is never triggered.
-void handleDomeAny()
+// ── Setup ─────────────────────────────────────────────────────────────────────
+static esp_err_t handleAlpacaSetup(httpd_req_t *req)
 {
     noteRequest(true);
-    HTTPMethod m = alpacaServer.method();
-    if (m == HTTP_OPTIONS) { addCorsHeaders(alpacaServer); alpacaServer.send(200); return; }
-    if (m == HTTP_GET)     { handleDomeGet(); return; }
-    if (m == HTTP_PUT)     { handleDomePut(); return; }
-    alpacaServer.send(405, "text/plain", "Method Not Allowed");
+    alpacaCors(req);
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req,
+        "<html><body><h1>Alpaca Setup</h1>"
+        "<p>This device uses fixed configuration in firmware.</p></body></html>",
+        HTTPD_RESP_USE_STRLEN);
+}
+
+// ── CORS preflight ────────────────────────────────────────────────────────────
+static esp_err_t handleAlpacaOptions(httpd_req_t *req)
+{
+    noteRequest(true);
+    alpacaCors(req);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "", 0);
+}
+
+static esp_err_t handleAlpacaFavicon(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, "", 0);
+}
+
+// Returning ESP_OK keeps the connection open.  The stock 404 handler closes it,
+// which would cost NINA its persistent connection over a single stray request.
+static esp_err_t handleAlpacaNotFound(httpd_req_t *req, httpd_err_code_t err)
+{
+    noteRequest(true);
+    alpacaCors(req);
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Not found", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Counts accepted TCP connections from inside the server — the denominator of
+// the requests-per-connection metric.  There is deliberately no close_fn: when
+// one is configured the server hands it the socket instead of closing it, and
+// getting the ownership of a file descriptor wrong on a roof controller is not
+// worth a second counter.
+static esp_err_t alpacaSessionOpen(httpd_handle_t hd, int sockfd)
+{
+    bumpCounter(s_alpacaConns);
+    return ESP_OK;
+}
+
+// ── Server startup ────────────────────────────────────────────────────────────
+static void registerAlpacaUri(const char *uri, httpd_method_t method,
+                              esp_err_t (*handler)(httpd_req_t *))
+{
+    httpd_uri_t u = {};   // zero-init: the struct has extra websocket fields
+    u.uri      = uri;
+    u.method   = method;
+    u.handler  = handler;
+    u.user_ctx = nullptr;
+
+    esp_err_t e = httpd_register_uri_handler(s_alpacaHttpd, &u);
+    if (e != ESP_OK)
+        Serial.printf("Alpaca httpd: register %s failed: %s\n", uri, esp_err_to_name(e));
+}
+
+void startAlpacaServer()
+{
+    if (s_alpacaHttpd) {
+        httpd_stop(s_alpacaHttpd);
+        s_alpacaHttpd = nullptr;
+    }
+
+    httpd_config_t cfg    = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port       = ALPACA_HTTP_PORT;
+    cfg.task_priority     = tskIDLE_PRIORITY + 5;
+    cfg.stack_size        = 6144;   // handlers keep ~600 B of buffers on the stack
+    cfg.core_id           = 0;      // off the Arduino loop's core (1)
+    cfg.max_open_sockets  = 4;      // NINA needs one; the rest is headroom
+    cfg.max_uri_handlers  = 12;
+    cfg.backlog_conn      = 5;
+    cfg.lru_purge_enable  = true;   // a wedged client cannot lock the others out
+    cfg.recv_wait_timeout = 5;      // a silent client is dropped, not held
+    cfg.send_wait_timeout = 5;
+    cfg.open_fn           = alpacaSessionOpen;
+    cfg.uri_match_fn      = httpd_uri_match_wildcard;
+
+    // Unlike WiFiServer::begin(), which returns void and fails silently, this
+    // reports a bind failure — so the guard GuardedWebServer exists to provide
+    // comes free here.
+    esp_err_t e = httpd_start(&s_alpacaHttpd, &cfg);
+    if (e != ESP_OK) {
+        s_alpacaHttpd = nullptr;
+        Serial.printf("Alpaca httpd start FAILED: %s\n", esp_err_to_name(e));
+        return;
+    }
+
+    registerAlpacaUri(DOME_PREFIX "*", HTTP_GET,     handleDomeGet);
+    registerAlpacaUri(DOME_PREFIX "*", HTTP_PUT,     handleDomePut);
+    registerAlpacaUri(DOME_PREFIX "*", HTTP_OPTIONS, handleAlpacaOptions);
+    registerAlpacaUri("/management/*", HTTP_GET,     handleManagement);
+    registerAlpacaUri("/management/*", HTTP_OPTIONS, handleAlpacaOptions);
+    registerAlpacaUri("/setup*",       HTTP_GET,     handleAlpacaSetup);
+    registerAlpacaUri("/favicon.ico",  HTTP_GET,     handleAlpacaFavicon);
+    httpd_register_err_handler(s_alpacaHttpd, HTTPD_404_NOT_FOUND, handleAlpacaNotFound);
+
+    Serial.printf("Alpaca server on port %d (esp_http_server, persistent)\n",
+                  ALPACA_HTTP_PORT);
+}
+
+// Live session count, for the status page.
+static int alpacaSessionCount()
+{
+    if (!s_alpacaHttpd) return 0;
+    int    fds[8];
+    size_t n = sizeof(fds) / sizeof(fds[0]);
+    if (httpd_get_client_list(s_alpacaHttpd, &n, fds) != ESP_OK) return -1;
+    return (int)n;
 }
 
 // ── Info page (port 80) ───────────────────────────────────────────────────────
@@ -853,6 +1165,8 @@ p{margin:6px 0}
 <p><b>WiFi drops since boot:</b> <span id="wd">&hellip;</span></p>
 <p><b>Requests (info/alpaca):</b> <span id="rq">&hellip;</span></p>
 <p><b>Request rate:</b> <span id="rt">&hellip;</span> /min</p>
+<p><b>Alpaca connections:</b> <span id="cn">&hellip;</span> (<span id="sx">&hellip;</span> open)</p>
+<p><b>Requests per connection:</b> <span id="pc">&hellip;</span></p>
 <p><b>Free heap:</b> <span id="hp">&hellip;</span> bytes</p>
 <p><b>Largest free block:</b> <span id="mb">&hellip;</span> bytes</p>
 <p><b>Listeners up:</b> <span id="ls">&hellip;</span></p>
@@ -868,6 +1182,7 @@ function upd(){
   sw("cs",d.closedSw);sw("os",d.openSw);
   T("up",d.uptimeMin);T("rs",d.rssi);T("wd",d.drops);
   T("rq",d.reqInfo+" / "+d.reqAlpaca);T("rt",d.rate);
+  T("cn",d.conns);T("sx",d.sess);T("pc",d.reqPerConn);
   T("hp",d.heap);T("mb",d.maxBlock);T("ls",d.listen?"yes":"NO");
  }).catch(function(){document.body.classList.add("stale");});
 }
@@ -894,11 +1209,16 @@ void handleStatusJson()
 {
     noteRequest(false);
 
-    char buf[400];
+    // reqPerConn is the number that says whether persistent connections are
+    // actually happening: 1 means every request still costs a TCP connection.
+    unsigned long conns = (unsigned long)s_alpacaConns;
+
+    char buf[480];
     snprintf(buf, sizeof(buf),
         "{\"shutter\":\"%s\",\"connected\":%s,\"closedSw\":%s,\"openSw\":%s,"
         "\"uptimeMin\":%lu,\"rssi\":%d,\"drops\":%lu,"
         "\"reqInfo\":%lu,\"reqAlpaca\":%lu,\"rate\":%lu,"
+        "\"conns\":%lu,\"reqPerConn\":%lu,\"sess\":%d,"
         "\"heap\":%lu,\"maxBlock\":%lu,\"listen\":%s}",
         shutterLabel(getShutterStatus()),
         s_alpacaConnected ? "true" : "false",
@@ -910,9 +1230,12 @@ void handleStatusJson()
         (unsigned long)s_infoRequests,
         (unsigned long)s_alpacaRequests,
         (unsigned long)s_recentRequests,
+        conns,
+        conns ? (unsigned long)s_alpacaRequests / conns : 0UL,
+        alpacaSessionCount(),
         (unsigned long)ESP.getFreeHeap(),
         (unsigned long)ESP.getMaxAllocHeap(),
-        (infoServer.isListening() && alpacaServer.isListening()) ? "true" : "false");
+        (infoServer.isListening() && s_alpacaHttpd) ? "true" : "false");
 
     infoServer.send(200, "application/json", buf);
 }
@@ -1131,50 +1454,11 @@ void setup()
     if (!infoServer.isListening()) Serial.println("WARNING: info server failed to listen");
     Serial.printf("Info server on port %d\n", INFO_PORT);
 
-    // Alpaca server — port 11111
-    // Register every known endpoint explicitly so WebServer's _currentHandler is
-    // always non-null.  onNotFound is only reached for genuinely unknown paths.
-    static const char* domeEps[] = {
-        "/api/v1/dome/0/connected",        "/api/v1/dome/0/description",
-        "/api/v1/dome/0/driverinfo",       "/api/v1/dome/0/driverversion",
-        "/api/v1/dome/0/interfaceversion", "/api/v1/dome/0/name",
-        "/api/v1/dome/0/supportedactions", "/api/v1/dome/0/cansetshutter",
-        "/api/v1/dome/0/canfindhome",      "/api/v1/dome/0/canpark",
-        "/api/v1/dome/0/cansetaltitude",   "/api/v1/dome/0/cansetazimuth",
-        "/api/v1/dome/0/cansetpark",       "/api/v1/dome/0/canslave",
-        "/api/v1/dome/0/cansyncazimuth",   "/api/v1/dome/0/shutterstatus",
-        "/api/v1/dome/0/slewing",          "/api/v1/dome/0/slaved",
-        "/api/v1/dome/0/athome",           "/api/v1/dome/0/atpark",
-        "/api/v1/dome/0/azimuth",          "/api/v1/dome/0/altitude",
-        "/api/v1/dome/0/openshutter",      "/api/v1/dome/0/closeshutter",
-        "/api/v1/dome/0/abortslew",        "/api/v1/dome/0/action",
-        "/api/v1/dome/0/commandblind",     "/api/v1/dome/0/commandbool",
-        "/api/v1/dome/0/commandstring",    "/api/v1/dome/0/findhome",
-        "/api/v1/dome/0/park",             "/api/v1/dome/0/setpark",
-        "/api/v1/dome/0/slewtoaltitude",   "/api/v1/dome/0/slewtoazimuth",
-        "/api/v1/dome/0/synctoazimuth",    nullptr
-    };
-    for (int i = 0; domeEps[i]; i++) {
-        alpacaServer.on(domeEps[i], HTTP_ANY, handleDomeAny);
-    }
-    alpacaServer.on("/management/apiversions",          HTTP_ANY, handleManagement);
-    alpacaServer.on("/management/v1/description",       HTTP_ANY, handleManagement);
-    alpacaServer.on("/management/v1/configureddevices", HTTP_ANY, handleManagement);
-    alpacaServer.on("/setup/v1/dome/0/setup", HTTP_ANY, []() {
-        addCorsHeaders(alpacaServer);
-        alpacaServer.send(200, "text/html",
-            "<html><body><h1>Alpaca Setup</h1>"
-            "<p>This device uses fixed configuration in firmware.</p>"
-            "</body></html>");
-    });
-    alpacaServer.on("/favicon.ico", HTTP_ANY, []() { alpacaServer.send(204); });
-    alpacaServer.onNotFound([]() {
-        addCorsHeaders(alpacaServer);
-        alpacaServer.send(404, "text/plain", "Not found");
-    });
-    alpacaServer.begin();
-    if (!alpacaServer.isListening()) Serial.println("WARNING: alpaca server failed to listen");
-    Serial.printf("Alpaca server on port %d\n", ALPACA_HTTP_PORT);
+    // Alpaca server — port 11111.  Routing is three wildcard handlers rather
+    // than the old 35-entry endpoint table; the dispatch on the endpoint name
+    // already lived inside the handler, so the table only existed to stop
+    // WebServer logging "request handler not found".
+    startAlpacaServer();
 
     // Alpaca UDP discovery
     startDiscovery();
@@ -1216,6 +1500,10 @@ void loop()
     // Sole owner of motion state — everything else only reads it
     updateMotionState();
 
+    // Alpaca commands arrive on the HTTP server's task and are executed here,
+    // so the relay and the motion state have exactly one writer.
+    runPendingCommand();
+
     // Movement timeout watchdog
     if ((s_motionState == MOTION_OPENING || s_motionState == MOTION_CLOSING) &&
         s_motionStartMs != 0 &&
@@ -1226,8 +1514,8 @@ void loop()
     maintainWifi();
 
     infoServer.handleClient();
-    alpacaServer.handleClient();
-    // discovery is callback-driven now — nothing to poll here
+    // Alpaca runs on its own task and discovery is callback-driven — neither
+    // needs polling here.  Port 80 is the only server left that does.
 
     // Roll the request-rate window
     if (millis() - s_windowStartMs >= REQ_WINDOW_MS) {
@@ -1246,19 +1534,23 @@ void loop()
         diagLog(EV_NET_STALL, (uint8_t)((millis() - s_lastRequestMs) / 60000UL));
         Serial.printf("No HTTP requests for %lu min (listening: info=%d alpaca=%d)\n",
                       (millis() - s_lastRequestMs) / 60000UL,
-                      infoServer.isListening(), alpacaServer.isListening());
+                      infoServer.isListening(), s_alpacaHttpd != nullptr);
     }
 
     // Serial heartbeat — the fingerprint of the fault is both request counts
     // going flat together while uptime and RSSI keep advancing.
     if (millis() - s_lastHeartbeatMs >= HEARTBEAT_MS) {
         s_lastHeartbeatMs = millis();
+        unsigned long conns = (unsigned long)s_alpacaConns;
         Serial.printf("up=%lumin rssi=%d req(info/alpaca)=%lu/%lu rate=%lu/min "
+                      "conn=%lu req/conn=%lu sess=%d "
                       "listen=%d/%d heap=%u maxblk=%u minfree=%u\n",
                       millis() / 60000UL, WiFi.RSSI(),
                       (unsigned long)s_infoRequests, (unsigned long)s_alpacaRequests,
                       (unsigned long)s_recentRequests,
-                      infoServer.isListening(), alpacaServer.isListening(),
+                      conns, conns ? (unsigned long)s_alpacaRequests / conns : 0UL,
+                      alpacaSessionCount(),
+                      infoServer.isListening(), s_alpacaHttpd != nullptr,
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     }
 
